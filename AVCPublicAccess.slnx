@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="AVCPublicAccess.Client/AVCPublicAccess.Client.csproj" />
+  <Project Path="AVCPublicAccess.Server/AVCPublicAccess.Server.csproj" />
+  <Project Path="AVCPublicAccess.Service/AVCPublicAccess.Service.csproj" />
+  <Project Path="AVCPublicAccess.Watchdog/AVCPublicAccess.Watchdog.csproj" />
+</Solution>

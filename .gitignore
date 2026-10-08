@@ -1,0 +1,74 @@
+﻿# Build output
+**/bin/
+**/obj/
+**/Build/
+**/Publish/
+**/Publish-Installer/
+**/publish/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Test results
+TestResults/
+*.trx
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+
+# Local logs
+*.log
+logs/
+
+# Local configuration / secrets
+appsettings.Local.json
+appsettings.*.Local.json
+secrets.json
+*.secret.json
+
+# Certificates / keys
+*.pfx
+*.p12
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# Deployment and historical archives
+**/FinalRelease/
+**/Archive/
+**/artifacts/
+**/InstallerOutput/
+*.zip
+
+# Historical source copies
+*.backup-*
+*.working-before-*
+
+# Additional local databases and deployment binaries
+*.sqlite
+*.sqlite3
+*.mdf
+*.ldf
+*.exe
+*.dll
+*.msi
+*.msix
+*.pdb

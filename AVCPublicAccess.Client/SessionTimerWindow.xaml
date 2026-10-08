@@ -1,0 +1,79 @@
+﻿<Window x:Class="AVCPublicAccess.Client.SessionTimerWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Session Time Remaining"
+        Width="145"
+        SizeToContent="Height"
+        WindowStyle="None"
+        ResizeMode="NoResize"
+        WindowStartupLocation="Manual"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        Topmost="True"
+        Background="Transparent"
+        AllowsTransparency="True">
+
+    <Border x:Name="OuterBorder"
+            Background="Transparent"
+            BorderBrush="#505050"
+            BorderThickness="1"
+            CornerRadius="7"
+            MouseLeftButtonDown="Timer_MouseLeftButtonDown">
+
+        <StackPanel>
+
+            <!-- Compact clock -->
+            <Border x:Name="TimerBorder"
+                    Background="Transparent"
+                    Padding="8,5,8,6"
+                    CornerRadius="7">
+
+                <StackPanel>
+
+                    <TextBlock x:Name="TimerTitleText"
+                               Text="TIME REMAINING"
+                               FontSize="9"
+                               FontWeight="SemiBold"
+                               Foreground="#505050"
+                               HorizontalAlignment="Center"/>
+
+                    <TextBlock x:Name="TimerValueText"
+                               Text="00:00"
+                               FontSize="22"
+                               FontWeight="Bold"
+                               Foreground="#202020"
+                               HorizontalAlignment="Center"
+                               Margin="0,-1,0,0"/>
+
+                </StackPanel>
+
+            </Border>
+
+            <!-- Warning appears below the compact clock -->
+            <Border x:Name="WarningBorder"
+                    Visibility="Collapsed"
+                    BorderThickness="0,1,0,0"
+                    BorderBrush="#C0A040"
+                    Background="#FFFFF3CD"
+                    Padding="6,4,6,5"
+                    CornerRadius="0,0,7,7">
+
+                <TextBlock x:Name="TimerWarningText"
+                           Text=""
+                           FontSize="9"
+                           FontWeight="SemiBold"
+                           Foreground="#704F00"
+                           TextAlignment="Center"
+                           TextWrapping="Wrap"
+                           HorizontalAlignment="Stretch"/>
+
+            </Border>
+
+        </StackPanel>
+
+    </Border>
+
+</Window>
+
+
+
