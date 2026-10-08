@@ -33,12 +33,16 @@
                                Margin="0,8,0,30"
                                HorizontalAlignment="Center"/>
 
-                    <TextBlock Text="Enter the 6-digit access code provided by staff."
+                    <TextBlock x:Name="AccessCodeInstructions"
+                               Text="Enter the 6-digit access code provided by staff."
                                FontSize="17"
                                TextAlignment="Center"
                                Margin="0,0,0,20"/>
 
-                    <TextBlock Text="Please note: When your session time expires, this computer will automatically reboot. A time-remaining countdown clock will be displayed during your session. You are responsible for monitoring your remaining time and saving your work before your session ends."
+                    <TextBlock x:Name="SessionInstructions"
+                               AutomationProperties.Name="After you enter your access code and start your session, a countdown timer will display the time remaining on the computer. When the timer reaches 00:00, the computer will automatically reboot and your session will end. Please save your work before the timer expires."
+                               Focusable="False"
+                               Text="After you enter your access code and start your session, a countdown timer will display the time remaining on the computer. When the timer reaches 00:00, the computer will automatically reboot and your session will end. Please save your work before the timer expires."
                                FontSize="14"
                                Foreground="DimGray"
                                TextAlignment="Center"
@@ -46,6 +50,11 @@
                                Margin="20,0,20,0"/>
 
                     <TextBox x:Name="CodeTextBox"
+                             AutomationProperties.Name="Access code, six digits"
+                             AutomationProperties.LabeledBy="{Binding ElementName=AccessCodeInstructions}"
+                             AutomationProperties.HelpText="{Binding Text, ElementName=AccessCodeInstructions}"
+                             KeyboardNavigation.TabIndex="0"
+                             PreviewKeyDown="CodeTextBox_PreviewKeyDown"
                              Width="260"
                              Height="60"
                              MaxLength="6"
@@ -56,6 +65,8 @@
                              TextChanged="CodeTextBox_TextChanged"/>
 
                     <Button x:Name="StartSessionButton"
+                            AutomationProperties.Name="Start session"
+                            KeyboardNavigation.TabIndex="1"
                             Content="Start Session"
                             Width="260"
                             Height="52"
@@ -65,6 +76,7 @@
                             Click="StartSessionButton_Click"/>
 
                     <TextBlock x:Name="ErrorText"
+                               AutomationProperties.LiveSetting="Assertive"
                                Margin="0,16,0,0"
                                FontSize="15"
                                Foreground="Firebrick"
@@ -74,6 +86,7 @@
                     <Separator Margin="0,28,0,18"/>
 
                     <TextBlock x:Name="ServiceStatusText"
+                               AutomationProperties.LiveSetting="Polite"
                                Text="Checking session service..."
                                FontSize="14"
                                Foreground="DimGray"

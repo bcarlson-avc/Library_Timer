@@ -1,4 +1,6 @@
-﻿using System.Net.Http;
+﻿using System.Windows.Automation.Peers;
+using System.Windows.Controls;
+using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 using System.Windows;
@@ -147,8 +149,7 @@ public partial class MainWindow : Window
                 return;
             }
 
-            ServiceStatusText.Text =
-                "Session service connected";
+            SetAccessibleMessage(ServiceStatusText, "Session service connected");
 
             if (!string.IsNullOrWhiteSpace(status.HostName))
             {
@@ -216,8 +217,7 @@ public partial class MainWindow : Window
                 return;
             }
 
-            ServiceStatusText.Text =
-                $"Service status: {status.Status}";
+            SetAccessibleMessage(ServiceStatusText, $"Service status: {status.Status}");
         }
         catch
         {
@@ -246,10 +246,9 @@ public partial class MainWindow : Window
         if (AccessCodeView.Visibility ==
             Visibility.Visible)
         {
-            ServiceStatusText.Text =
-                "Session service unavailable";
+            SetAccessibleMessage(ServiceStatusText, "Session service unavailable");
 
-            ErrorText.Text = message;
+            SetAccessibleMessage(ErrorText, message);
 
             StartSessionButton.IsEnabled = false;
         }
@@ -263,6 +262,17 @@ public partial class MainWindow : Window
 
     private void ShowAccessCodeView()
     {
+        // An Available poll is not a new screen transition.
+        if (IsVisible && AccessCodeView.Visibility == Visibility.Visible)
+        {
+            if (CodeTextBox.IsEnabled)
+            {
+                StartSessionButton.IsEnabled = CodeTextBox.Text.Length == 6;
+            }
+
+            return;
+        }
+
         CloseFloatingTimer();
 
         AccessCodeView.Visibility =
@@ -274,7 +284,7 @@ public partial class MainWindow : Window
         ExpiredView.Visibility =
             Visibility.Collapsed;
 
-        ErrorText.Text = "";
+        SetAccessibleMessage(ErrorText, "");
 
         StartSessionButton.IsEnabled =
             CodeTextBox.Text.Length == 6;
@@ -528,6 +538,37 @@ public partial class MainWindow : Window
         }
     }
 
+    private void SetAccessibleMessage(TextBlock control, string message)
+    {
+        if (control.Text == message)
+        {
+            return;
+        }
+
+        control.Text = message;
+
+        // Announce meaningful changes only on the visible access-code screen.
+        if (string.IsNullOrWhiteSpace(message) || !control.IsVisible ||
+            AccessCodeView.Visibility != Visibility.Visible)
+        {
+            return;
+        }
+
+        var peer = UIElementAutomationPeer.FromElement(control) ??
+            UIElementAutomationPeer.CreatePeerForElement(control);
+        peer?.RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
+    }
+
+    private void CodeTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter && StartSessionButton.IsEnabled &&
+            CodeTextBox.Text.Length == 6 && CodeTextBox.Text.All(char.IsDigit))
+        {
+            e.Handled = true;
+            StartSessionButton_Click(StartSessionButton, new RoutedEventArgs());
+        }
+    }
+
     private void CodeTextBox_PreviewTextInput(
         object sender,
         TextCompositionEventArgs e)
@@ -563,7 +604,7 @@ public partial class MainWindow : Window
         StartSessionButton.IsEnabled =
             CodeTextBox.Text.Length == 6;
 
-        ErrorText.Text = "";
+        SetAccessibleMessage(ErrorText, "");
     }
 
     private async void StartSessionButton_Click(
@@ -576,8 +617,7 @@ public partial class MainWindow : Window
         if (code.Length != 6 ||
             !code.All(char.IsDigit))
         {
-            ErrorText.Text =
-                "Enter the six-digit access code provided by staff.";
+            SetAccessibleMessage(ErrorText, "Enter the six-digit access code provided by staff.");
 
             return;
         }
@@ -585,10 +625,9 @@ public partial class MainWindow : Window
         StartSessionButton.IsEnabled = false;
         CodeTextBox.IsEnabled = false;
 
-        ErrorText.Text = "";
+        SetAccessibleMessage(ErrorText, "");
 
-        ServiceStatusText.Text =
-            "Validating access code...";
+        SetAccessibleMessage(ServiceStatusText, "Validating access code...");
 
         try
         {
@@ -606,13 +645,11 @@ public partial class MainWindow : Window
                     await response.Content
                         .ReadFromJsonAsync<ErrorResponse>();
 
-                ErrorText.Text =
-                    !string.IsNullOrWhiteSpace(error?.Error)
+                SetAccessibleMessage(ErrorText, !string.IsNullOrWhiteSpace(error?.Error)
                         ? error.Error
-                        : "The access code could not be validated.";
+                        : "The access code could not be validated.");
 
-                ServiceStatusText.Text =
-                    "Session service connected";
+                SetAccessibleMessage(ServiceStatusText, "Session service connected");
 
                 return;
             }
@@ -624,8 +661,7 @@ public partial class MainWindow : Window
             if (session == null ||
                 !session.Success)
             {
-                ErrorText.Text =
-                    "The session service returned an invalid response.";
+                SetAccessibleMessage(ErrorText, "The session service returned an invalid response.");
 
                 return;
             }
@@ -643,11 +679,9 @@ public partial class MainWindow : Window
                     StringComparison.OrdinalIgnoreCase) ||
                 !initialStatus.RemainingSeconds.HasValue)
             {
-                ErrorText.Text =
-                    "Unable to obtain the active session timer.";
+                SetAccessibleMessage(ErrorText, "Unable to obtain the active session timer.");
 
-                ServiceStatusText.Text =
-                    "Session timer unavailable";
+                SetAccessibleMessage(ServiceStatusText, "Session timer unavailable");
 
                 return;
             }
@@ -673,11 +707,9 @@ public partial class MainWindow : Window
         }
         catch
         {
-            ErrorText.Text =
-                "Unable to contact the local session service.";
+            SetAccessibleMessage(ErrorText, "Unable to contact the local session service.");
 
-            ServiceStatusText.Text =
-                "Session service unavailable";
+            SetAccessibleMessage(ServiceStatusText, "Session service unavailable");
         }
         finally
         {
@@ -688,6 +720,16 @@ public partial class MainWindow : Window
             {
                 StartSessionButton.IsEnabled =
                     CodeTextBox.Text.Length == 6;
+
+                // Restore lost focus after a failed submission, but leave a
+                // usable focus target or another application undisturbed.
+                var focusedElement = Keyboard.FocusedElement as UIElement;
+                if (!string.IsNullOrWhiteSpace(ErrorText.Text) && IsActive &&
+                    (focusedElement == null || focusedElement == this ||
+                     !focusedElement.IsVisible || !focusedElement.IsEnabled))
+                {
+                    CodeTextBox.Focus();
+                }
             }
         }
     }
