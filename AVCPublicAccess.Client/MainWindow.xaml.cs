@@ -1,4 +1,5 @@
-﻿using System.Windows.Automation.Peers;
+﻿using System.Windows.Automation;
+using System.Windows.Automation.Peers;
 using System.Windows.Controls;
 using System.Net.Http;
 using System.Net.Http.Json;
@@ -23,6 +24,14 @@ public partial class MainWindow : Window
 
     private DateTime? _sessionExpiresUtc;
     private bool _expiredViewShown;
+
+    // Presentation metadata only; never used to calculate the session deadline.
+    private DateTime? _presentationExpirationUtc;
+    private DateTime? _sessionStartedUtc;
+    private int? _originalDurationMinutes;
+    private bool _startAnnounced;
+    private readonly HashSet<int> _announcedMilestones = new();
+    private double? _announcementPreviousSeconds;
 
     private bool _tenMinuteWarningShown;
     private bool _fiveMinuteWarningShown;
@@ -176,6 +185,7 @@ public partial class MainWindow : Window
                     ResetWarnings();
                 }
 
+                PrepareSessionInformation(status.SessionExpiresUtc);
                 _sessionExpiresUtc = newExpiration;
                 _expiredViewShown = false;
 
@@ -190,6 +200,7 @@ public partial class MainWindow : Window
                     "Expired",
                     StringComparison.OrdinalIgnoreCase))
             {
+                PrepareSessionInformation(status.SessionExpiresUtc);
                 if (status.SessionExpiresUtc.HasValue)
                 {
                     _sessionExpiresUtc =
@@ -366,10 +377,15 @@ public partial class MainWindow : Window
         Topmost = true;
         Activate();
         Focus();
+        if (_announcedMilestones.Add(0))
+        {
+            AnnounceSessionMessage("Session ended. The computer will now reboot.");
+        }
     }
 
     private void EnsureFloatingTimer()
     {
+        _sessionTimerWindow?.SetSessionInformation(_sessionStartedUtc, _originalDurationMinutes);
         if (_sessionTimerWindow != null)
         {
             if (!_sessionTimerWindow.IsVisible)
@@ -383,6 +399,7 @@ public partial class MainWindow : Window
         _sessionTimerWindow =
             new SessionTimerWindow();
 
+        _sessionTimerWindow.SetSessionInformation(_sessionStartedUtc, _originalDurationMinutes);
         _sessionTimerWindow.Show();
     }
 
@@ -459,6 +476,80 @@ public partial class MainWindow : Window
             remaining);
 
         CheckSessionWarnings(remaining);
+        AnnounceSessionMilestones(remaining);
+    }
+
+    private void PrepareSessionInformation(DateTime? expirationUtc, int? durationMinutes = null)
+    {
+        if (!expirationUtc.HasValue) return;
+        var expiration = DateTime.SpecifyKind(expirationUtc.Value, DateTimeKind.Utc);
+        if (_presentationExpirationUtc != expiration)
+        {
+            _presentationExpirationUtc = expiration;
+            _sessionStartedUtc = null;
+            _originalDurationMinutes = null;
+            _startAnnounced = false;
+            _announcedMilestones.Clear();
+            _announcementPreviousSeconds = null;
+        }
+
+        if (durationMinutes > 0)
+        {
+            _originalDurationMinutes = durationMinutes;
+            _sessionStartedUtc = expiration.AddMinutes(-durationMinutes.Value);
+        }
+    }
+
+    private void AnnounceSessionMessage(string message)
+    {
+        // Dispatch after rendering; never wait for speech or alter countdown timing.
+        Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            UIElement target = ExpiredView.Visibility == Visibility.Visible
+                ? this : _sessionTimerWindow ?? (UIElement)this;
+            var peer = UIElementAutomationPeer.FromElement(target) ??
+                UIElementAutomationPeer.CreatePeerForElement(target);
+            peer?.RaiseNotificationEvent(AutomationNotificationKind.Other,
+                AutomationNotificationProcessing.ImportantAll, message, "Session status");
+        }));
+    }
+
+    private void AnnounceSessionMilestones(TimeSpan remaining)
+    {
+        if (!_startAnnounced && _sessionStartedUtc.HasValue && _originalDurationMinutes.HasValue)
+        {
+            _startAnnounced = true;
+            var duration = SessionTimerWindow.DescribeRemainingTime(
+                TimeSpan.FromMinutes(_originalDurationMinutes.Value));
+            AnnounceSessionMessage($"Session started. You have {duration}. " +
+                $"Your session started at {_sessionStartedUtc.Value.ToLocalTime():t}. " +
+                "The countdown timer is now active.");
+        }
+
+        var seconds = remaining.TotalSeconds;
+        var milestones = new (int Seconds, string Message)[]
+        {
+            (300, "5 minutes remaining. Please save your work."),
+            (60, "1 minute remaining. Session ending. Please save your work."),
+            (30, "30 seconds remaining. Please save your work."),
+            (10, "10 seconds remaining.")
+        };
+
+        // On restoration below a threshold, announce only the most relevant
+        // warning; do not replay older milestones or announce every poll.
+        var crossed = milestones.Where(m => seconds <= m.Seconds &&
+            !_announcedMilestones.Contains(m.Seconds) &&
+            (!_announcementPreviousSeconds.HasValue ||
+             _announcementPreviousSeconds.Value > m.Seconds)).ToArray();
+        foreach (var milestone in crossed)
+        {
+            _announcedMilestones.Add(milestone.Seconds);
+            if (_announcementPreviousSeconds.HasValue)
+                AnnounceSessionMessage(milestone.Message);
+        }
+        if (!_announcementPreviousSeconds.HasValue && crossed.Length > 0)
+            AnnounceSessionMessage(crossed[^1].Message);
+        _announcementPreviousSeconds = seconds;
     }
 
     private void CheckSessionWarnings(
@@ -665,6 +756,8 @@ public partial class MainWindow : Window
 
                 return;
             }
+
+            PrepareSessionInformation(session.SessionExpiresUtc, session.DurationMinutes);
 
             // Immediately obtain the authoritative remaining time from
             // the local Service. Do not calculate the initial countdown

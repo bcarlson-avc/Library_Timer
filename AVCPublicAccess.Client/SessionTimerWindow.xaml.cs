@@ -1,4 +1,5 @@
 ﻿using System.ComponentModel;
+using System.Windows.Automation;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -13,15 +14,16 @@ public partial class SessionTimerWindow : Window
     private readonly DispatcherTimer _pulseTimer;
     private bool _pulseState;
     private bool _finalMinuteActive;
+    private int _appearanceStage;
 
     public SessionTimerWindow()
     {
         InitializeComponent();
 
-        // Pulse twice per second during the final minute.
+        // Alternate emphasis slowly during the final minute.
         _pulseTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(500)
+            Interval = TimeSpan.FromSeconds(1.5)
         };
 
         _pulseTimer.Tick += PulseTimer_Tick;
@@ -29,6 +31,10 @@ public partial class SessionTimerWindow : Window
         Loaded += SessionTimerWindow_Loaded;
         Closing += SessionTimerWindow_Closing;
         LocationChanged += SessionTimerWindow_LocationChanged;
+        SizeChanged += (_, _) => KeepOnScreen();
+        SystemParameters.StaticPropertyChanged += SystemParameters_Changed;
+        Closed += (_, _) =>
+            SystemParameters.StaticPropertyChanged -= SystemParameters_Changed;
 
         // Normal countdown appearance.
         // The timer becomes fully opaque during the final minute.
@@ -99,28 +105,10 @@ public partial class SessionTimerWindow : Window
                 ? ActualHeight
                 : 60;
 
-        var newLeft = Left;
-        var newTop = Top;
-
-        if (newLeft < workArea.Left)
-        {
-            newLeft = workArea.Left;
-        }
-
-        if (newTop < workArea.Top)
-        {
-            newTop = workArea.Top;
-        }
-
-        if (newLeft + width > workArea.Right)
-        {
-            newLeft = workArea.Right - width;
-        }
-
-        if (newTop + height > workArea.Bottom)
-        {
-            newTop = workArea.Bottom - height;
-        }
+        var newLeft = Math.Clamp(Left, workArea.Left,
+            Math.Max(workArea.Left, workArea.Right - width));
+        var newTop = Math.Clamp(Top, workArea.Top,
+            Math.Max(workArea.Top, workArea.Bottom - height));
 
         if (Math.Abs(Left - newLeft) > 0.5)
         {
@@ -133,9 +121,61 @@ public partial class SessionTimerWindow : Window
         }
     }
 
+    public void SetSessionInformation(DateTime? startedUtc, int? durationMinutes)
+    {
+        SessionStartedText.Text = startedUtc.HasValue
+            ? $"Session started: {startedUtc.Value.ToLocalTime():t}"
+            : "Session started: unavailable";
+        SessionLengthText.Text = durationMinutes.HasValue
+            ? $"Session length: {durationMinutes.Value} minutes"
+            : "Session length: unavailable";
+    }
+
+    public static string DescribeRemainingTime(TimeSpan remaining)
+    {
+        var seconds = Math.Max(0, (long)remaining.TotalSeconds);
+        var parts = new List<string>();
+        var hours = seconds / 3600;
+        var minutes = seconds / 60 % 60;
+        var remainder = seconds % 60;
+        if (hours > 0) parts.Add($"{hours} {(hours == 1 ? "hour" : "hours")}");
+        if (minutes > 0) parts.Add($"{minutes} {(minutes == 1 ? "minute" : "minutes")}");
+        if (remainder > 0 || parts.Count == 0)
+            parts.Add($"{remainder} {(remainder == 1 ? "second" : "seconds")}");
+        return string.Join(", ", parts);
+    }
+
+    private void SystemParameters_Changed(object? sender, PropertyChangedEventArgs e)
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(new Action(() => SystemParameters_Changed(sender, e)));
+            return;
+        }
+
+        if (_finalMinuteActive)
+        {
+            if (SystemParameters.ClientAreaAnimation)
+            {
+                _pulseTimer.Start();
+            }
+            else
+            {
+                _pulseTimer.Stop();
+                _pulseState = false;
+                ApplyFinalMinuteAppearance();
+            }
+        }
+
+        KeepOnScreen();
+    }
+
     public void UpdateTime(
         TimeSpan remaining)
     {
+        AutomationProperties.SetName(TimerValueText,
+            $"Session time remaining: {DescribeRemainingTime(remaining)}.");
+
         if (remaining <= TimeSpan.Zero)
         {
             StopFinalMinutePulse();
@@ -166,7 +206,16 @@ public partial class SessionTimerWindow : Window
     private void UpdateAppearance(
         TimeSpan remaining)
     {
-        // Final minute: solid and flashing.
+        var stage = remaining.TotalSeconds <= 60 ? 2
+            : remaining.TotalMinutes <= 5 ? 1 : 0;
+        // Once entered, a warning stage remains active until expiration.
+        if (stage <= _appearanceStage)
+        {
+            return;
+        }
+        _appearanceStage = stage;
+
+        // Final minute: fully opaque with slow alternating emphasis.
         if (remaining.TotalSeconds <= 60)
         {
             Opacity = 1.0;
@@ -174,7 +223,7 @@ public partial class SessionTimerWindow : Window
                 "SESSION ENDING";
 
             TimerWarningText.Text =
-                "Save your work now";
+                "Please save your work";
 
             WarningBorder.Visibility =
                 Visibility.Visible;
@@ -191,7 +240,7 @@ public partial class SessionTimerWindow : Window
         // Five minutes or less: strong warning appearance.
         if (remaining.TotalMinutes <= 5)
         {
-            Opacity = 0.65;
+            Opacity = 0.9;
             StopFinalMinutePulse();
 
             OuterBorder.BorderBrush =
@@ -247,9 +296,9 @@ public partial class SessionTimerWindow : Window
 
 
         OuterBorder.Background =
-            Brushes.Transparent;
+            Brushes.White;
         TimerBorder.Background =
-            Brushes.Transparent;
+            Brushes.White;
 
         TimerTitleText.Text =
             "TIME REMAINING";
@@ -273,7 +322,7 @@ public partial class SessionTimerWindow : Window
 
         ApplyFinalMinuteAppearance();
 
-        if (!_pulseTimer.IsEnabled)
+        if (SystemParameters.ClientAreaAnimation && !_pulseTimer.IsEnabled)
         {
             _pulseTimer.Start();
         }
