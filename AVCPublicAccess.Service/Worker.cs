@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Hosting.WindowsServices;
 
 namespace AVCPublicAccess.Service;
 
@@ -12,168 +13,92 @@ public class Worker : BackgroundService
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IConfiguration _configuration;
 
-    private readonly object _sessionLock = new();
-
-    private DateTime? _localSessionExpiresUtc;
-    private long? _sessionEndTickCount64;
-    private bool _expirationLogged;
-
+    private readonly SessionEnforcement _session;
+    private readonly SemaphoreSlim _redeemGate = new(1, 1);
+    private readonly TaskCompletionSource _requestFailure =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private HttpListener? _listener;
-
     private string _hostName = "";
     private string _serverAddress = "";
     private string _location = "";
-
-    private DateTime _currentBootUtc;
+    private bool _unownedSessionLogged;
 
     private const string LocalApiPrefix =
         "http://127.0.0.1:5051/";
 
-    private static readonly string StateDirectory =
-        Path.Combine(
-            Environment.GetFolderPath(
-                Environment.SpecialFolder.CommonApplicationData),
-            "AVC",
-            "PublicAccess");
-
-    private static readonly string StateFile =
-        Path.Combine(
-            StateDirectory,
-            "session-state.json");
-
     public Worker(
         ILogger<Worker> logger,
         IHttpClientFactory httpClientFactory,
-        IConfiguration configuration)
+        IConfiguration configuration,
+        SessionEnforcement session)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _configuration = configuration;
+        _session = session;
     }
 
-    protected override async Task ExecuteAsync(
-        CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _hostName =
-            Environment.MachineName.ToUpperInvariant();
-
-        _serverAddress =
-            _configuration["PublicAccess:ServerAddress"]
-            ?? throw new InvalidOperationException(
-                "PublicAccess:ServerAddress is not configured.");
-
-        _serverAddress =
-            _serverAddress.TrimEnd('/');
-
-        _location =
-            _configuration["PublicAccess:Location"] ?? "";
-
-        var heartbeatSeconds =
-            _configuration.GetValue<int>(
-                "PublicAccess:HeartbeatSeconds",
-                15);
-
-        if (heartbeatSeconds < 5)
-        {
-            heartbeatSeconds = 5;
-        }
-
-        Directory.CreateDirectory(
-            StateDirectory);
-
-        _currentBootUtc =
-            GetCurrentBootTimeUtc();
-
-        _logger.LogInformation(
-            "Current Windows boot UTC: {BootTime:O}",
-            _currentBootUtc);
-
-        LoadPersistentSession();
-
-        _logger.LogInformation(
-            "AVC Public Access Service starting.");
-
-        _logger.LogInformation(
-            "Computer: {HostName}",
-            _hostName);
-
-        _logger.LogInformation(
-            "Server: {ServerAddress}",
-            _serverAddress);
-
-        _logger.LogInformation(
-            "Location: {Location}",
-            _location);
-
-        _logger.LogInformation(
-            "Local patron API: {LocalApi}",
-            LocalApiPrefix);
-
-        _logger.LogWarning(
-            "SESSION ENFORCEMENT IS IN TEST MODE. " +
-            "Expiration and End Session requests " +
-            "will NOT reboot Windows.");
-
-        var localApiTask =
-            RunLocalApiAsync(
-                stoppingToken);
-
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var tasks = new List<Task>();
         try
         {
-            while (!stoppingToken.IsCancellationRequested)
-            {
-                CheckLocalExpiration();
+            _hostName = Environment.MachineName.ToUpperInvariant();
+            _serverAddress = (_configuration["PublicAccess:ServerAddress"] ??
+                throw new InvalidOperationException("PublicAccess:ServerAddress is not configured."))
+                .TrimEnd('/');
+            _location = _configuration["PublicAccess:Location"] ?? "";
+            var heartbeatSeconds = Math.Max(5,
+                _configuration.GetValue<int>("PublicAccess:HeartbeatSeconds", 15));
 
-                await SendHeartbeatAsync(
-                    stoppingToken);
-
-                CheckLocalExpiration();
-
-                try
-                {
-                    await Task.Delay(
-                        TimeSpan.FromSeconds(
-                            heartbeatSeconds),
-                        stoppingToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-            }
+            _session.Initialize(_hostName);
+            tasks.Add(RunLocalApiAsync(lifetime.Token));
+            tasks.Add(RunExpirationAsync(lifetime.Token));
+            tasks.Add(RunHeartbeatAsync(heartbeatSeconds, lifetime.Token));
+            var completed = await Task.WhenAny(tasks.Append(_requestFailure.Task));
+            await completed;
+            if (!stoppingToken.IsCancellationRequested)
+                throw new FatalServiceException("A required Service loop stopped unexpectedly.");
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Normal Windows Service shutdown; persisted enforcement is retained.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogCritical(ex, "Service startup/readiness or enforcement failure; exiting unsuccessfully.");
+            Environment.ExitCode = 1;
+            // A Windows Service must exit unsuccessfully for SCM recovery to see a failure.
+            if (WindowsServiceHelpers.IsWindowsService()) Environment.Exit(1);
+            throw;
         }
         finally
         {
-            if (_listener != null)
-            {
-                try
-                {
-                    _listener.Stop();
-                    _listener.Close();
-                }
-                catch
-                {
-                    // Service is shutting down.
-                }
-            }
+            lifetime.Cancel();
+            try { _listener?.Close(); } catch { /* Listener is already closing. */ }
+            try { await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (Exception) { /* The original failure above is the authoritative one. */ }
+            _logger.LogInformation("AVC Public Access Service stopping.");
+        }
+    }
 
-            try
-            {
-                await localApiTask;
-            }
-            catch (OperationCanceledException)
-            {
-                // Normal shutdown.
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(
-                    ex,
-                    "Local API stopped during shutdown.");
-            }
+    private async Task RunExpirationAsync(CancellationToken stoppingToken)
+    {
+        // No heartbeat, HTTP request, or Server response participates in this loop.
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await _session.CheckAsync(stoppingToken);
+            await Task.Delay(TimeSpan.FromMilliseconds(250), stoppingToken);
+        }
+    }
 
-            _logger.LogInformation(
-                "AVC Public Access Service stopping.");
+    private async Task RunHeartbeatAsync(int heartbeatSeconds, CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await SendHeartbeatAsync(stoppingToken);
+            await Task.Delay(TimeSpan.FromSeconds(heartbeatSeconds), stoppingToken);
         }
     }
 
@@ -239,113 +164,28 @@ public class Worker : BackgroundService
         }
     }
 
-    private void ProcessServerState(
-        HeartbeatResponse serverState)
+    private void ProcessServerState(HeartbeatResponse serverState)
     {
-        if (!serverState.Status.Equals(
-                "In Use",
-                StringComparison.OrdinalIgnoreCase) ||
-            !serverState.SessionExpiresUtc.HasValue)
+        if (!serverState.Status.Equals("In Use", StringComparison.OrdinalIgnoreCase) ||
+            !serverState.SessionExpiresUtc.HasValue) return;
+
+        var local = _session.Snapshot();
+        if (!local.ExpiresUtc.HasValue)
         {
+            // A Server heartbeat may still describe the previous patron after reboot.
+            // Only a successful local redemption establishes a new local session.
+            if (!_unownedSessionLogged)
+            {
+                _logger.LogWarning("Server reports a session without current-boot local state. " +
+                    "It will not be resurrected from a heartbeat.");
+                _unownedSessionLogged = true;
+            }
             return;
         }
-
-        var serverExpiration =
-            DateTime.SpecifyKind(
-                serverState.SessionExpiresUtc.Value,
-                DateTimeKind.Utc);
-
-        var serverNow =
-            DateTime.SpecifyKind(
-                serverState.ServerTimeUtc,
-                DateTimeKind.Utc);
-
-        var remainingSeconds =
-            Math.Max(
-                0,
-                (serverExpiration - serverNow)
-                    .TotalSeconds);
-
-        lock (_sessionLock)
-        {
-            // Once this local session has expired, heartbeat
-            // reconciliation must never resurrect it.
-            //
-            // In production the machine will reboot at expiration.
-            // In TEST mode we intentionally preserve the Expired
-            // state so it can be verified safely.
-            if (_expirationLogged)
-            {
-                return;
-            }
-
-            if (_localSessionExpiresUtc.HasValue &&
-                _localSessionExpiresUtc.Value ==
-                    serverExpiration &&
-                _sessionEndTickCount64.HasValue)
-            {
-                return;
-            }
-
-            _localSessionExpiresUtc =
-                serverExpiration;
-
-            _sessionEndTickCount64 =
-                Environment.TickCount64 +
-                (long)Math.Ceiling(
-                    remainingSeconds * 1000.0);
-
-            _expirationLogged = false;
-
-            SavePersistentSessionLocked();
-
-            _logger.LogWarning(
-                "ACTIVE SESSION DETECTED. " +
-                "Expires UTC: {Expiration:O}. " +
-                "Authoritative remaining: {Minutes:F1} minutes.",
-                serverExpiration,
-                remainingSeconds / 60.0);
-        }
+        if (local.ExpiresUtc != DateTime.SpecifyKind(serverState.SessionExpiresUtc.Value, DateTimeKind.Utc))
+            _logger.LogWarning("Server session differs from authoritative local session; local deadline retained.");
     }
-    private void CheckLocalExpiration()
-    {
-        lock (_sessionLock)
-        {
-            if (!_localSessionExpiresUtc.HasValue ||
-                !_sessionEndTickCount64.HasValue)
-            {
-                return;
-            }
 
-            if (_sessionEndTickCount64.Value >
-                Environment.TickCount64)
-            {
-                return;
-            }
-
-            if (_expirationLogged)
-            {
-                return;
-            }
-
-            _expirationLogged = true;
-
-            _logger.LogCritical(
-                "SESSION EXPIRED. " +
-                "Production enforcement would " +
-                "force a Windows reboot now.");
-
-            //
-            // IMPORTANT:
-            // Do NOT clear the persistent session here.
-            //
-            // In production the reboot/boot-confirmation
-            // workflow will clear it. Keeping it now lets
-            // us verify that restarting this service does
-            // not bypass an expired session.
-            //
-        }
-    }
     private async Task RunLocalApiAsync(
         CancellationToken stoppingToken)
     {
@@ -369,9 +209,10 @@ public class Worker : BackgroundService
                 ex,
                 "Unable to start local patron API.");
 
-            return;
+            throw new FatalServiceException("Local patron API listener failed to start.", ex);
         }
 
+        _logger.LogInformation("Service ready. Reboot enforcement enabled; local API: {Prefix}.", LocalApiPrefix);
         while (!stoppingToken.IsCancellationRequested)
         {
             HttpListenerContext context;
@@ -392,17 +233,14 @@ public class Worker : BackgroundService
             {
                 break;
             }
-            catch (ObjectDisposedException)
+            catch (ObjectDisposedException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(
-                    ex,
-                    "Local API listener error.");
-
-                continue;
+                _logger.LogCritical(ex, "Local API listener failed.");
+                throw new FatalServiceException("Local API listener failed.", ex);
             }
 
             _ = HandleLocalRequestAsync(
@@ -483,6 +321,17 @@ public class Worker : BackgroundService
                 },
                 stoppingToken);
         }
+        catch (FatalServiceException ex)
+        {
+            _logger.LogCritical(ex, "Local API encountered an authoritative state failure.");
+            _requestFailure.TrySetException(ex);
+            try
+            {
+                await WriteJsonAsync(context, 503,
+                    new { error = "The session service is unavailable." }, stoppingToken);
+            }
+            catch { /* The client may have disconnected. */ }
+        }
         catch (Exception ex)
         {
             _logger.LogError(
@@ -523,41 +372,12 @@ public class Worker : BackgroundService
         HttpListenerContext context,
         CancellationToken stoppingToken)
     {
-        DateTime? expiration;
-        double? remainingSeconds;
-        bool expired;
-
-        lock (_sessionLock)
-        {
-            expiration =
-                _localSessionExpiresUtc;
-
-            if (expiration.HasValue &&
-                _sessionEndTickCount64.HasValue)
-            {
-                remainingSeconds =
-                    Math.Max(
-                        0,
-                        (_sessionEndTickCount64.Value -
-                            Environment.TickCount64) /
-                        1000.0);
-
-                expired =
-                    remainingSeconds <= 0;
-            }
-            else
-            {
-                remainingSeconds = null;
-                expired = false;
-            }
-        }
-
-        var status =
-            expiration.HasValue
-                ? expired
-                    ? "Expired"
-                    : "In Use"
-                : "Available";
+        var session = _session.Snapshot();
+        var expiration = session.ExpiresUtc;
+        var remainingSeconds = session.RemainingSeconds;
+        var status = expiration.HasValue
+            ? remainingSeconds <= 0 ? "Expired" : "In Use"
+            : "Available";
 
         return WriteJsonAsync(
             context,
@@ -570,13 +390,20 @@ public class Worker : BackgroundService
                     expiration,
                 RemainingSeconds =
                     remainingSeconds,
-                TestMode = true,
+                TestMode = false,
                 ServerTimeUtc =
                     DateTime.UtcNow
             },
             stoppingToken);
     }
-    private async Task HandleRedeemAsync(
+    private async Task HandleRedeemAsync(HttpListenerContext context, CancellationToken stoppingToken)
+    {
+        await _redeemGate.WaitAsync(stoppingToken);
+        try { await HandleRedeemCoreAsync(context, stoppingToken); }
+        finally { _redeemGate.Release(); }
+    }
+
+    private async Task HandleRedeemCoreAsync(
         HttpListenerContext context,
         CancellationToken stoppingToken)
     {
@@ -625,24 +452,10 @@ public class Worker : BackgroundService
             return;
         }
 
-        DateTime? existingSession;
-
-        lock (_sessionLock)
+        var existingSession = _session.Snapshot();
+        if (existingSession.ExpiresUtc.HasValue)
         {
-            existingSession = _localSessionExpiresUtc;
-        }
-
-        if (existingSession.HasValue)
-        {
-            bool existingExpired;
-
-            lock (_sessionLock)
-            {
-                existingExpired =
-                    !_sessionEndTickCount64.HasValue ||
-                    _sessionEndTickCount64.Value <=
-                        Environment.TickCount64;
-            }
+            var existingExpired = existingSession.RemainingSeconds <= 0;
 
             var status =
                 existingExpired
@@ -730,8 +543,8 @@ public class Worker : BackgroundService
                         responseText,
                         JsonOptions);
 
-            if (session == null ||
-                !session.Success)
+            if (session == null || !session.Success || session.DurationMinutes <= 0 ||
+                session.SessionExpiresUtc == default)
             {
                 await WriteJsonAsync(
                     context,
@@ -751,21 +564,10 @@ public class Worker : BackgroundService
                     session.SessionExpiresUtc,
                     DateTimeKind.Utc);
 
-            lock (_sessionLock)
+            if (!_session.TryStart(expiration,
+                TimeSpan.FromMinutes(session.DurationMinutes).TotalSeconds))
             {
-                _localSessionExpiresUtc =
-                    expiration;
-
-                _sessionEndTickCount64 =
-                    Environment.TickCount64 +
-                    (long)TimeSpan
-                        .FromMinutes(
-                            session.DurationMinutes)
-                        .TotalMilliseconds;
-
-                _expirationLogged = false;
-
-                SavePersistentSessionLocked();
+                throw new LocalSessionException("This computer already has a session.");
             }
 
             _logger.LogWarning(
@@ -786,7 +588,7 @@ public class Worker : BackgroundService
                         session.DurationMinutes,
                     SessionExpiresUtc =
                         expiration,
-                    TestMode = true
+                    TestMode = false
                 },
                 stoppingToken);
         }
@@ -795,6 +597,7 @@ public class Worker : BackgroundService
         {
             throw;
         }
+        catch (FatalServiceException) { throw; }
         catch (LocalSessionException ex)
         {
             await WriteJsonAsync(
@@ -825,222 +628,22 @@ public class Worker : BackgroundService
     }
 
     private async Task HandleEndSessionAsync(
-        HttpListenerContext context,
-        CancellationToken stoppingToken)
+        HttpListenerContext context, CancellationToken stoppingToken)
     {
-        DateTime? expiration;
-
-        lock (_sessionLock)
+        if (!_session.RequestEnd())
         {
-            expiration =
-                _localSessionExpiresUtc;
-        }
-
-        if (!expiration.HasValue)
-        {
-            await WriteJsonAsync(
-                context,
-                409,
-                new
-                {
-                    error =
-                        "There is no active session."
-                },
-                stoppingToken);
-
+            await WriteJsonAsync(context, 409,
+                new { error = "There is no active session." }, stoppingToken);
             return;
         }
 
-        _logger.LogCritical(
-            "END SESSION REQUESTED. " +
-            "Production enforcement would force " +
-            "a Windows reboot now.");
-
-        //
-        // TEST MODE:
-        // Do not reboot and do not clear the
-        // persistent session.
-        //
-
-        await WriteJsonAsync(
-            context,
-            200,
-            new
-            {
-                Success = true,
-                Message =
-                    "End Session received. " +
-                    "TEST MODE - Windows was not rebooted.",
-                TestMode = true
-            },
-            stoppingToken);
-    }
-
-    private void LoadPersistentSession()
-    {
-        if (!File.Exists(StateFile))
+        // The independent enforcement loop issues the one shared reboot workflow.
+        await WriteJsonAsync(context, 200, new
         {
-            return;
-        }
-
-        try
-        {
-            var json =
-                File.ReadAllText(
-                    StateFile);
-
-            var state =
-                JsonSerializer.Deserialize
-                    <PersistentSessionState>(
-                        json,
-                        JsonOptions);
-
-            if (state?.SessionExpiresUtc == null)
-            {
-                return;
-            }
-
-            _localSessionExpiresUtc =
-                DateTime.SpecifyKind(
-                    state.SessionExpiresUtc.Value,
-                    DateTimeKind.Utc);
-
-            _sessionEndTickCount64 =
-                state.SessionEndTickCount64;
-
-            if (!_sessionEndTickCount64.HasValue)
-            {
-                //
-                // Legacy state has no monotonic deadline.
-                // Fail closed rather than deriving time
-                // from the workstation clock.
-                //
-                _sessionEndTickCount64 =
-                    Environment.TickCount64;
-            }
-
-            _expirationLogged = false;
-
-            _logger.LogWarning(
-                "Persistent session restored. " +
-                "Expiration UTC: {Expiration:O}",
-                _localSessionExpiresUtc);
-
-            if (!state.BootTimeUtc.HasValue)
-            {
-                _logger.LogWarning(
-                    "Persistent session has no boot identity. " +
-                    "Treating it as legacy state and preserving it.");
-            }
-            else
-            {
-                var savedBootUtc =
-                    DateTime.SpecifyKind(
-                        state.BootTimeUtc.Value,
-                        DateTimeKind.Utc);
-
-                var sameBoot =
-                    Math.Abs(
-                        (savedBootUtc - _currentBootUtc)
-                        .TotalSeconds) < 5;
-
-                if (sameBoot)
-                {
-                    _logger.LogInformation(
-                        "Persistent session belongs to the " +
-                        "current Windows boot.");
-                }
-                else
-                {
-                    _logger.LogWarning(
-                        "BOOT CHANGE DETECTED. " +
-                        "Saved boot UTC: {SavedBoot:O}. " +
-                        "Current boot UTC: {CurrentBoot:O}.",
-                        savedBootUtc,
-                        _currentBootUtc);
-
-                    _logger.LogWarning(
-                        "Windows has restarted since the previous session. " +
-                        "Clearing the completed local session state.");
-
-                    _localSessionExpiresUtc = null;
-                    _sessionEndTickCount64 = null;
-                    _expirationLogged = false;
-
-                    try
-                    {
-                        File.Delete(StateFile);
-
-                        _logger.LogInformation(
-                            "Previous session state cleared after confirmed Windows reboot.");
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(
-                            ex,
-                            "Unable to clear previous session state after reboot.");
-
-                        throw;
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(
-                ex,
-                "Unable to load persistent session state.");
-
-            //
-            // Fail closed:
-            // do not silently delete an unreadable
-            // session-state file.
-            //
-        }
-    }
-
-    private static DateTime GetCurrentBootTimeUtc()
-    {
-        var uptime =
-            TimeSpan.FromMilliseconds(
-                Environment.TickCount64);
-
-        return DateTime.UtcNow - uptime;
-    }
-
-    private void SavePersistentSessionLocked()
-    {
-        Directory.CreateDirectory(
-            StateDirectory);
-
-        var state =
-            new PersistentSessionState
-            {
-                HostName = _hostName,
-                SessionExpiresUtc =
-                    _localSessionExpiresUtc,
-                SessionEndTickCount64 =
-                    _sessionEndTickCount64,
-                BootTimeUtc =
-                    _currentBootUtc
-            };
-
-        var json =
-            JsonSerializer.Serialize(
-                state,
-                JsonOptions);
-
-        var temporaryFile =
-            StateFile + ".tmp";
-
-        File.WriteAllText(
-            temporaryFile,
-            json);
-
-        File.Move(
-            temporaryFile,
-            StateFile,
-            true);
+            Success = true,
+            Message = "Session ended. The computer will now reboot.",
+            TestMode = false
+        }, stoppingToken);
     }
 
     private static async Task WriteJsonAsync(
@@ -1086,14 +689,6 @@ public class Worker : BackgroundService
     private sealed class RedeemLocalRequest
     {
         public string Code { get; set; } = "";
-    }
-
-    private sealed class PersistentSessionState
-    {
-        public string HostName { get; set; } = "";
-        public DateTime? SessionExpiresUtc { get; set; }
-        public long? SessionEndTickCount64 { get; set; }
-        public DateTime? BootTimeUtc { get; set; }
     }
 
     private sealed class HeartbeatResponse
