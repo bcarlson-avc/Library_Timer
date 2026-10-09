@@ -8,4 +8,9 @@
     <UseWPF>true</UseWPF>
   </PropertyGroup>
 
+  <ItemGroup>
+    <None Remove="Images/avc-logo.png" />
+    <Resource Include="Images/avc-logo.png" />
+  </ItemGroup>
+
 </Project>

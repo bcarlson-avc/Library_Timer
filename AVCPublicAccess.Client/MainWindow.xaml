@@ -22,10 +22,12 @@
 
                 <StackPanel>
 
-                    <TextBlock Text="AVC"
-                               FontSize="26"
-                               FontWeight="Bold"
-                               HorizontalAlignment="Center"/>
+                    <Image Source="pack://application:,,,/Images/avc-logo.png"
+                           Width="300"
+                           Stretch="Uniform"
+                           HorizontalAlignment="Center"
+                           AutomationProperties.Name="Antelope Valley College"
+                           Focusable="False"/>
 
                     <TextBlock Text="Public Computer Access"
                                FontSize="30"
@@ -202,6 +204,14 @@
                     VerticalAlignment="Center">
 
                 <StackPanel>
+
+                    <Image Source="pack://application:,,,/Images/avc-logo.png"
+                           Width="300"
+                           Stretch="Uniform"
+                           HorizontalAlignment="Center"
+                           AutomationProperties.Name="Antelope Valley College"
+                           Focusable="False"
+                           Margin="0,0,0,20"/>
 
                     <TextBlock Text="Session Ended"
                                FontSize="34"
