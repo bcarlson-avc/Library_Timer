@@ -1,0 +1,5 @@
+{
+  "version": "1.0.0",
+  "dotnetSdk": "10.0.401",
+  "innoSetup": "7.1.0"
+}

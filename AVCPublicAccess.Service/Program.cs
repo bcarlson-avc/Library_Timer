@@ -4,7 +4,7 @@ var builder = Host.CreateApplicationBuilder(args);
 
 builder.Services.AddWindowsService(options =>
 {
-    options.ServiceName = "AVC Public Access Service";
+    options.ServiceName = "AVCPublicAccessService";
 });
 
 builder.Services.AddHttpClient();
