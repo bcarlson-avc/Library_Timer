@@ -1,0 +1,189 @@
+name: Build AVC Public Access installer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'AVCPublicAccess.Client/**'
+      - 'AVCPublicAccess.Service/**'
+      - 'AVCPublicAccess.Watchdog/**'
+      - 'deployment/**'
+      - 'AVCPublicAccess.slnx'
+      - '**/*.csproj'
+      - '**/*.props'
+      - '**/*.targets'
+      - '.github/workflows/build-installer.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      INNOEXTRACT_COMMIT: 376a13e7c41cc5528b6088d0dd16ec1b323a8d37
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: true
+
+      - name: Verify source commit and package versions
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) { throw 'Checkout does not match the triggering commit.' }
+          if (@(git status --porcelain).Count -ne 0) { throw 'Checkout is not clean.' }
+          # Build-Package requires a local branch named main. Preserve the exact
+          # event commit even when dispatching or pushing from another branch.
+          git switch -C main $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the local build branch.' }
+          $version = Get-Content deployment/version.json -Raw | ConvertFrom-Json
+          if ($version.version -ne '1.0.0' -or $version.dotnetSdk -ne '10.0.401' -or $version.innoSetup -ne '7.1.0') {
+            throw 'Update and review the workflow when changing pinned package/tool versions.'
+          }
+          Write-Host "Source commit: $head"
+          Write-Host "Installer version: $($version.version)"
+
+      - name: Set up pinned .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.401'
+
+      - name: Verify .NET SDK
+        run: |
+          if ((dotnet --version).Trim() -ne '10.0.401') { throw 'Unexpected .NET SDK.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot run .NET SDK.' }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify Python and install Inno Setup 7.1.0 x64
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -c "import sys; assert sys.version_info >= (3, 11); print(sys.version)"
+          if ($LASTEXITCODE -ne 0) { throw 'Python 3.11+ is required.' }
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.0-x64.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -OutFile $setup
+          $signature = Get-AuthenticodeSignature -LiteralPath $setup
+          if ($signature.Status -ne 'Valid') { throw 'Inno Setup download has no valid Authenticode signature.' }
+          Write-Host "Inno Setup signer: $($signature.SignerCertificate.Subject)"
+          $destination = Join-Path $env:RUNNER_TEMP 'InnoSetup-7.1.0-x64'
+          $process = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$destination`"") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Inno Setup tool installation failed: $($process.ExitCode)" }
+          $iscc = Join-Path $destination 'ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw 'ISCC.exe is missing.' }
+          $compilerVersion = (& $iscc --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $compilerVersion -ne '7.1.0') { throw 'Unexpected Inno Setup compiler version.' }
+          $bytes = [IO.File]::ReadAllBytes($iscc)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x8664) { throw 'Inno Setup compiler is not x64.' }
+          "ISCC_PATH=$iscc" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Inno Setup x64: $compilerVersion"
+
+      - name: Set up native Windows extractor build tools
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: >-
+            curl
+            tar
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-xz
+            mingw-w64-ucrt-x86_64-bzip2
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Build pinned Inno 7 compatible innoextract
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          tools="$(cygpath -u "$RUNNER_TEMP")/avc-innoextract"
+          mkdir -p "$tools/source"
+          curl --fail --location --retry 3 \
+            "https://api.github.com/repos/dscharrer/innoextract/tarball/$INNOEXTRACT_COMMIT" \
+            --output "$tools/source.tar.gz"
+          tar -xzf "$tools/source.tar.gz" --strip-components=1 -C "$tools/source"
+          # Match the documented PR 210 correction: absent optional ISSig
+          # verification is not a SHA256 of zeroes. Archive checks stay enabled.
+          python - "$tools/source/src/setup/file.cpp" <<'PY'
+          import pathlib
+          import sys
+          path = pathlib.Path(sys.argv[1])
+          source = path.read_text()
+          old = 'if(i.version < INNO_VERSION(6, 5, 0)) {\n\t\t// For Inno Setup 6.5.0+'
+          new = 'if(i.version < INNO_VERSION(6, 5, 0) || verification == FileVerificationNone) {\n\t\t// For Inno Setup 6.5.0+'
+          if source.count(old) != 1:
+              raise RuntimeError('Pinned extractor source no longer matches the reviewed fix')
+          path.write_text(source.replace(old, new))
+          PY
+          cmake -S "$tools/source" -B "$tools/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DUSE_LTO=OFF
+          cmake --build "$tools/build" --parallel 2
+          "$tools/build/innoextract.exe" --version
+          echo "INNOEXTRACT_PATH=$(cygpath -w "$tools/build/innoextract.exe")" >> "$GITHUB_ENV"
+          cygpath -w /ucrt64/bin >> "$GITHUB_PATH"
+          echo "Extractor source: $INNOEXTRACT_COMMIT plus documented optional ISSig correction"
+
+      - name: Build and verify fresh installer
+        run: |
+          ./deployment/scripts/Build-Package.ps1 -Iscc $env:ISCC_PATH -InnoExtract $env:INNOEXTRACT_PATH -Python python
+
+      - name: Run deployment validation
+        run: |
+          ./deployment/tests/Test-Deployment.ps1
+
+      - name: Verify artifact and display provenance
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:GITHUB_WORKSPACE 'Build/Installer'
+          $installer = Join-Path $work 'output/AVCPublicAccess-Client-Setup-1.0.0-win-x64.exe'
+          $sums = Join-Path $work 'output/SHA256SUMS.txt'
+          if (-not (Test-Path $installer) -or -not (Test-Path $sums)) { throw 'Missing installer or checksum file.' }
+          $manifest = Get-Content (Join-Path $work 'stage/Deployment/payload-manifest.json') -Raw | ConvertFrom-Json
+          if ($manifest.sourceCommit -ne $env:GITHUB_SHA -or $manifest.version -ne '1.0.0' -or $manifest.runtime -ne 'win-x64' -or -not $manifest.selfContained -or @($manifest.applicationChanges).Count -ne 0) {
+            throw 'Package provenance does not match this build.'
+          }
+          $validation = Get-Content (Join-Path $work 'logs/package-validation.log') -Raw
+          if ($validation -notmatch 'every SHA256 matches fresh staging' -or $validation -notmatch 'Staging verified:') { throw 'Package verification evidence is missing.' }
+          $sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $filename = Split-Path $installer -Leaf
+          if (@(Get-Content $sums) -notcontains "$sha  $filename") { throw 'Installer checksum file does not match.' }
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA -or $LASTEXITCODE -ne 0) { throw 'HEAD changed.' }
+          if (@(git status --porcelain --untracked-files=all).Count -ne 0 -or $LASTEXITCODE -ne 0) { throw 'Build changed the working tree.' }
+          Write-Host "Commit: $env:GITHUB_SHA"
+          Write-Host 'Installer version: 1.0.0'
+          Write-Host "Installer: $filename"
+          Write-Host "SHA256: $sha"
+          Write-Host "Size: $((Get-Item $installer).Length) bytes"
+          @(
+            '### AVC Public Access installer'
+            "Commit: $env:GITHUB_SHA"
+            'Version: 1.0.0 (win-x64)'
+            "Filename: $filename"
+            "SHA256: $sha"
+          ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AVCPublicAccess-Client-Setup-1.0.0-win-x64
+          path: |
+            Build/Installer/output/AVCPublicAccess-Client-Setup-1.0.0-win-x64.exe
+            Build/Installer/output/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
