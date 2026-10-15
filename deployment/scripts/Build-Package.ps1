@@ -15,11 +15,42 @@ $work = Join-Path $root 'Build/Installer'
 $stage = Join-Path $work 'stage'
 $output = Join-Path $work 'output'
 
-function Run-Native([string]$Program, [string[]]$Arguments, [string]$Log, [int]$ExpectedExitCode = 0) {
-    $lines = & $Program @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $lines | Set-Content -LiteralPath $Log -Encoding utf8
-    $lines | ForEach-Object { Write-Host $_ }
+function Run-Native([string]$Program, [string[]]$Arguments, [string]$Log, [int]$ExpectedExitCode = 0, [string]$ResultReport = '') {
+    # PowerShell can background Windows GUI executables invoked with &. Use a
+    # process object for both GUI tests and console tools, never a stale LASTEXITCODE.
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Program
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw "Cannot start $Program" }
+        # Drain both pipes concurrently before waiting, avoiding buffer deadlocks.
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $exitCode = $process.ExitCode
+    } finally { $process.Dispose() }
+    "[stdout]`n$stdout`n[stderr]`n$stderr`nExit code: $exitCode (expected $ExpectedExitCode)" |
+        Set-Content -LiteralPath $Log -Encoding utf8
+    if ($stdout.Length -gt 0) { Write-Host $stdout -NoNewline }
+    if ($stderr.Length -gt 0) { Write-Host $stderr -NoNewline }
+    Write-Host "Process exit code: $exitCode (expected $ExpectedExitCode)"
+    # Publish the completed report before either the exit-code or PASS gate can
+    # throw, so CI distinguishes a failed assertion from a missing report.
+    if ($ResultReport) {
+        if (Test-Path -LiteralPath $ResultReport) {
+            Write-Host "Completed results report: $ResultReport"
+            Write-Host (Get-Content -LiteralPath $ResultReport -Raw)
+        } else {
+            Write-Host "Results report is missing after process completion: $ResultReport"
+        }
+    }
     if ($exitCode -ne $ExpectedExitCode) { throw "$Program returned $exitCode (expected $ExpectedExitCode); see $Log" }
 }
 function Compiler-Path([string]$Path) {
@@ -99,10 +130,10 @@ $testExe = Join-Path $testOutput 'InstallerSelfTest.exe'
 $testReport = Join-Path $testOutput 'results.txt'
 if ($Wine) {
     Run-Native $Wine (@((Compiler-Path $Iscc)) + $testArguments) (Join-Path $work 'logs/test-compile.log')
-    Run-Native $Wine @((Compiler-Path $testExe),'/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$(Compiler-Path $testReport)") (Join-Path $work 'logs/test-run.log')
+    Run-Native $Wine @((Compiler-Path $testExe),'/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$(Compiler-Path $testReport)") (Join-Path $work 'logs/test-run.log') 0 $testReport
 } else {
     Run-Native $Iscc $testArguments (Join-Path $work 'logs/test-compile.log')
-    Run-Native $testExe @('/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$testReport") (Join-Path $work 'logs/test-run.log')
+    Run-Native $testExe @('/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$testReport") (Join-Path $work 'logs/test-run.log') 0 $testReport
 }
 if (-not (Test-Path $testReport) -or (Get-Content $testReport -Raw) -notmatch '^PASS:') { throw 'Compiled installer tests did not pass.' }
 Get-Content $testReport | ForEach-Object { Write-Host $_ }
