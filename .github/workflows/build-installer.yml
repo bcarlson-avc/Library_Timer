@@ -131,6 +131,39 @@ jobs:
               raise RuntimeError('Pinned extractor source no longer matches the reviewed fix')
           path.write_text(source.replace(old, new))
           PY
+          # Modern MinGW/UCRT64 exposes a global isatty() that conflicts with
+          # the pinned source's using util::isatty declaration. Keep the Windows
+          # implementation and qualify only its Windows console call sites.
+          python - "$tools/source/src" <<'PY'
+          import pathlib
+          import sys
+          root = pathlib.Path(sys.argv[1])
+          patches = {
+              'util/windows.hpp': [(
+                  '\nusing util::isatty;\n',
+                  '\n',
+              )],
+              'util/console.cpp': [(
+                  '\t#if defined(_WIN32) || INNOEXTRACT_HAVE_ISATTY\n\tis_tty = isatty(1) && isatty(2);',
+                  '\t#if defined(_WIN32)\n\tis_tty = util::isatty(1) && util::isatty(2);\n\t#elif INNOEXTRACT_HAVE_ISATTY\n\tis_tty = isatty(1) && isatty(2);',
+              ), (
+                  '\t} else if(mode == DeferredClear && isatty(1)) {',
+                  '\t} else if(mode == DeferredClear && util::isatty(1)) {',
+              )],
+          }
+          updated = {}
+          for relative, replacements in patches.items():
+              path = root / relative
+              source = path.read_text()
+              for old, new in replacements:
+                  if source.count(old) != 1:
+                      raise RuntimeError(f'Pinned source no longer matches the reviewed isatty fix: {relative}')
+                  source = source.replace(old, new, 1)
+              updated[path] = source
+          for path, source in updated.items():
+              path.write_text(source)
+              print(f'Applied temporary MinGW isatty compatibility patch: {path.relative_to(root)}')
+          PY
           cmake -S "$tools/source" -B "$tools/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DUSE_LTO=OFF
           cmake --build "$tools/build" --parallel 2
