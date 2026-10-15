@@ -1,4 +1,6 @@
-# Pure/mocked installer-support checks. No Service, task, process, or registry changes.
+# Legacy reference checks plus compiled installer test evidence. The PowerShell
+# helper remains a development reference only; it is not a workstation payload.
+# Build-Package executes InstallerSelfTest with mocked platform boundaries.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '../scripts/Deployment.ps1') -Action Library
@@ -93,4 +95,21 @@ try {
     $env:ProgramData = $previousProgramData
     Remove-Item -LiteralPath $temporary -Recurse -Force
 }
-Write-Host "$checks deployment helper checks passed. No Windows deployment actions executed."
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+$report = Join-Path $root 'Build/Installer/tests/results.txt'
+Check (Test-Path $report) 'Run Build-Package first to execute the compiled installer tests'
+Check ((Get-Content $report -Raw) -match '^PASS:') 'Compiled installer tests failed'
+$installer = Get-Content (Join-Path $root 'deployment/installer/AVCPublicAccess.iss') -Raw
+$native = Get-Content (Join-Path $root 'deployment/installer/NativeDeployment.iss') -Raw
+$lifecycle = Get-Content (Join-Path $root 'deployment/installer/Lifecycle.iss') -Raw
+Check (($installer + $native + $lifecycle) -notmatch '(?i)powershell\.exe|pwsh\.exe|cmd\.exe|Deployment\.ps1|-ExecutionPolicy') 'Runtime shell/script dependency returned'
+Check ($installer -match 'ServerPage\.Values\[1\] := ''5000''') 'Default server port changed'
+Check ($installer -match 'I have confirmed this workstation is THAWED') 'Thawed confirmation removed'
+$lifecycleReport = Join-Path $root 'Build/Installer/tests/lifecycle-results.txt'
+Check (Test-Path $lifecycleReport) 'Missing actual Inno lifecycle/exit-code probe results'
+Check ((Get-Content $lifecycleReport -Raw) -match '^PASS:') 'Actual Inno lifecycle probes failed'
+Check ($installer -match 'FinishedHeadingLabel.Caption := ''Installation FAILED - NOT VERIFIED''') 'Failure finish-page heading missing'
+Check ($installer -match 'FinishedLabel.Caption := UnverifiedNotice') 'Unverified/THAWED finish-page notice missing'
+Write-Host "$checks legacy/reference and integration checks passed. No Windows deployment actions executed."
+Write-Host (Get-Content $report -Raw)
+Write-Host (Get-Content $lifecycleReport -Raw)

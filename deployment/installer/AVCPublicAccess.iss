@@ -44,7 +44,6 @@ Source: "{#StageRoot}\Client\*"; DestDir: "{app}\Client"; Flags: ignoreversion r
 Source: "{#StageRoot}\Service\*"; DestDir: "{app}\Service"; Excludes: "appsettings.json"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Preserve working configuration on upgrades and retain it on uninstall.
 Source: "{#StageRoot}\Service\appsettings.json"; DestDir: "{app}\Service"; Flags: onlyifdoesntexist uninsneveruninstall
-Source: "{#StageRoot}\Deployment\Deployment.ps1"; DestDir: "{app}\Deployment"; Flags: ignoreversion
 Source: "{#StageRoot}\Deployment\payload-manifest.json"; DestDir: "{app}\Deployment"; Flags: ignoreversion
 
 [Code]
@@ -60,70 +59,13 @@ begin
   Result := '"' + Value + '"';
 end;
 
-function RunDeployment(const Action, ScriptPath, Extra: String; var MessageText: String): Boolean;
-var
-  ResultCode: Integer;
-  Report, Params: String;
-  Lines: TArrayOfString;
-begin
-  Report := ExpandConstant('{tmp}\avc-deployment-result.txt');
-  DeleteFile(Report);
-  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + Quote(ScriptPath) +
-    ' -Action ' + Action + ' -InstallRoot ' + Quote(ExpandConstant('{app}')) +
-    ' -ReportPath ' + Quote(Report) + Extra;
-  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params,
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Result := Result and (ResultCode = 0);
-  MessageText := '';
-  if FileExists(Report) and LoadStringsFromFile(Report, Lines) then
-    if GetArrayLength(Lines) > 0 then MessageText := Lines[0];
-  if (not Result) and (MessageText = '') then
-    MessageText := 'AVC deployment helper failed. Installation is not verified; do not freeze this workstation.';
-end;
+#include "Json.iss"
+#include "NativeDeployment.iss"
+#include "Lifecycle.iss"
 
-function ValidAddress(const Value: String): Boolean;
-var
-  I, PartLength, PartValue, PartCount: Integer;
-  Numeric, PreviousHyphen: Boolean;
-  C: Char;
-begin
-  Result := False;
-  if (Length(Value) = 0) or (Length(Value) > 253) then Exit;
-  Numeric := True;
-  for I := 1 to Length(Value) do
-    if not (((Value[I] >= '0') and (Value[I] <= '9')) or (Value[I] = '.')) then Numeric := False;
-  PartLength := 0;
-  PartValue := 0;
-  PartCount := 1;
-  PreviousHyphen := False;
-  for I := 1 to Length(Value) do begin
-    C := Value[I];
-    if C = '.' then begin
-      if (PartLength = 0) or PreviousHyphen then Exit;
-      if Numeric and ((PartLength > 3) or (PartValue > 255)) then Exit;
-      PartLength := 0;
-      PartValue := 0;
-      PartCount := PartCount + 1;
-    end else begin
-      if not (((C >= 'a') and (C <= 'z')) or ((C >= 'A') and (C <= 'Z')) or
-        ((C >= '0') and (C <= '9')) or (C = '-')) then Exit;
-      if (PartLength = 0) and (C = '-') then Exit;
-      if Numeric and (PartLength = 1) and (PartValue = 0) then Exit;
-      PartLength := PartLength + 1;
-      if PartLength > 63 then Exit;
-      if Numeric then PartValue := PartValue * 10 + Ord(C) - Ord('0');
-      PreviousHyphen := C = '-';
-    end;
-  end;
-  if (PartLength = 0) or PreviousHyphen then Exit;
-  if Numeric and ((PartCount <> 4) or (PartLength > 3) or (PartValue > 255)) then Exit;
-  Result := True;
-end;
+#include "Endpoint.iss"
 
 function ValidEndpoint: Boolean;
-var
-  I, Port: Integer;
-  Value: String;
 begin
   Result := False;
   ServerPage.Values[0] := Trim(ServerPage.Values[0]);
@@ -131,18 +73,7 @@ begin
     MsgBox('Enter a hostname or IPv4 address, without a URL scheme or path.', mbError, MB_OK);
     Exit;
   end;
-  Value := ServerPage.Values[1];
-  if (Length(Value) = 0) or (Length(Value) > 5) then begin
-    MsgBox('Enter a numeric TCP port from 1 through 65535.', mbError, MB_OK);
-    Exit;
-  end;
-  for I := 1 to Length(Value) do
-    if (Value[I] < '0') or (Value[I] > '9') then begin
-      MsgBox('Enter a numeric TCP port from 1 through 65535.', mbError, MB_OK);
-      Exit;
-    end;
-  Port := StrToIntDef(Value, 0);
-  if (Port < 1) or (Port > 65535) then begin
+  if not ValidPort(ServerPage.Values[1]) then begin
     MsgBox('Enter a numeric TCP port from 1 through 65535.', mbError, MB_OK);
     Exit;
   end;
@@ -192,17 +123,37 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 var
-  MessageText, SettingsPath: String;
+  Endpoint, Host, Port, Config: String;
+  Split: Integer;
 begin
+  if (CurPageID = wpFinished) and InstallFailed then begin
+    WizardForm.Caption := 'AVC Public Access - installation FAILED';
+    WizardForm.FinishedHeadingLabel.Caption := 'Installation FAILED - NOT VERIFIED';
+    WizardForm.FinishedLabel.Caption := UnverifiedNotice;
+    WizardForm.NextButton.Caption := 'Close (failed)';
+    WizardForm.NoRadio.Checked := True;
+    WizardForm.YesRadio.Visible := False;
+    WizardForm.NoRadio.Visible := False;
+  end;
   if (CurPageID = ServerPage.ID) and ((not SettingsLoaded) or (SettingsRoot <> ExpandConstant('{app}'))) then begin
-    ExtractTemporaryFile('Deployment.ps1');
-    if not RunDeployment('ReadSettings', ExpandConstant('{tmp}\Deployment.ps1'), '', MessageText) then
-      RaiseException(MessageText);
-    SettingsPath := ExpandConstant('{tmp}\avc-deployment-result.txt');
-    ServerPage.Values[0] := GetIniString('Server', 'Address', '', SettingsPath);
-    ServerPage.Values[1] := GetIniString('Server', 'Port', '5000', SettingsPath);
-    SettingsLoaded := True;
-    SettingsRoot := ExpandConstant('{app}');
+    DeploymentRoot := RemoveBackslashUnlessRoot(ExpandFileName(ExpandConstant('{app}')));
+    CheckPath(DeploymentRoot);
+    Config := DeploymentRoot + '\Service\appsettings.json';
+    Host := ''; Port := '5000';
+    if PathPresent(Config) then begin
+      Endpoint := ConfigEndpoint(ReadJsonFile(Config));
+      Require(CompareText(Copy(Endpoint, 1, 7), 'http://') = 0, 'Existing endpoint requires administrator review.');
+      Delete(Endpoint, 1, 7);
+      if (Length(Endpoint) > 0) and (Endpoint[Length(Endpoint)] = '/') then
+        Delete(Endpoint, Length(Endpoint), 1);
+      Split := Pos(':', Endpoint);
+      if Split = 0 then begin Host := Endpoint; Port := '80'; end
+      else begin Host := Copy(Endpoint, 1, Split - 1); Port := Copy(Endpoint, Split + 1, Length(Endpoint)); end;
+      Require(ValidAddress(Host), 'Existing server address requires administrator review.');
+    end;
+    ServerPage.Values[0] := Host; ServerPage.Values[1] := Port;
+    if Host <> '' then Require(ValidEndpoint, 'Existing endpoint requires administrator review.');
+    SettingsLoaded := True; SettingsRoot := ExpandConstant('{app}');
   end;
 end;
 
@@ -216,45 +167,28 @@ begin
   end;
 end;
 
+function InitializeSetup: Boolean;
+begin
+  Result := not WizardSilent;
+  if not Result then MsgBox('Unattended installation is not supported. Confirm THAWED/no patron session interactively.', mbError, MB_OK);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  MessageText: String;
 begin
   Result := '';
-  if WizardSilent then begin
-    Result := 'Unattended installation is not supported. Use the Server connection and Deep Freeze verification pages.';
-    Exit;
+  try
+    Require(FreezePage.Values[0], 'Confirm THAWED and no active patron session.');
+    Require(ValidEndpoint, 'Invalid server endpoint.');
+    StopDeployment;
+  except
+    Result := GetExceptionMessage + ' Installation is not verified; do not freeze this workstation.';
   end;
-  ExtractTemporaryFile('Deployment.ps1');
-  if not RunDeployment('Prepare', ExpandConstant('{tmp}\Deployment.ps1'), '', MessageText) then Result := MessageText;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
-var
-  MessageText, Extra: String;
 begin
   if CurStep = ssPostInstall then begin
-    Extra := ' -ServerAddress ' + Quote(ServerPage.Values[0]) + ' -ServerPort ' + Quote(ServerPage.Values[1]);
-    if not RunDeployment('Install', ExpandConstant('{app}\Deployment\Deployment.ps1'), Extra, MessageText) then
-      RaiseException(MessageText);
+    VerifyPostInstall('http://' + ServerPage.Values[0] + ':' + IntToStr(StrToInt(ServerPage.Values[1])));
+    if InstallFailed then MsgBox(UnverifiedNotice, mbError, MB_OK);
   end;
-end;
-
-function InitializeUninstall: Boolean;
-var
-  MessageText: String;
-begin
-  Result := False;
-  if MsgBox('Uninstall only while THAWED and with no patron session. Continue?', mbConfirmation, MB_YESNO) <> idYes then Exit;
-  Result := RunDeployment('Preflight', ExpandConstant('{app}\Deployment\Deployment.ps1'), '', MessageText);
-  if not Result then MsgBox(MessageText, mbError, MB_OK);
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-var
-  MessageText: String;
-begin
-  if CurUninstallStep = usUninstall then
-    if not RunDeployment('Uninstall', ExpandConstant('{app}\Deployment\Deployment.ps1'), '', MessageText) then
-      RaiseException(MessageText);
 end;

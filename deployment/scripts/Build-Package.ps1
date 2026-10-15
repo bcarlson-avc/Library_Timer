@@ -15,12 +15,12 @@ $work = Join-Path $root 'Build/Installer'
 $stage = Join-Path $work 'stage'
 $output = Join-Path $work 'output'
 
-function Run-Native([string]$Program, [string[]]$Arguments, [string]$Log) {
+function Run-Native([string]$Program, [string[]]$Arguments, [string]$Log, [int]$ExpectedExitCode = 0) {
     $lines = & $Program @Arguments 2>&1
     $exitCode = $LASTEXITCODE
     $lines | Set-Content -LiteralPath $Log -Encoding utf8
     $lines | ForEach-Object { Write-Host $_ }
-    if ($exitCode -ne 0) { throw "$Program failed with exit $exitCode; see $Log" }
+    if ($exitCode -ne $ExpectedExitCode) { throw "$Program returned $exitCode (expected $ExpectedExitCode); see $Log" }
 }
 function Compiler-Path([string]$Path) {
     if ($Wine) { return 'Z:' + [IO.Path]::GetFullPath($Path).Replace('/', '\') }
@@ -79,8 +79,7 @@ foreach ($name in @('Client','Service','Watchdog')) {
 }
 $deployment = Join-Path $stage 'Deployment'
 $null = New-Item -ItemType Directory -Path $deployment
-Copy-Item (Join-Path $PSScriptRoot 'Deployment.ps1') $deployment
-foreach ($file in @('deployment/version.json','deployment/installer/AVCPublicAccess.iss','deployment/scripts/Deployment.ps1','deployment/scripts/Build-Package.ps1','deployment/scripts/verify-package.py')) {
+foreach ($file in @('deployment/version.json','deployment/installer/AVCPublicAccess.iss','deployment/installer/Endpoint.iss','deployment/installer/Json.iss','deployment/installer/NativeDeployment.iss','deployment/installer/Lifecycle.iss','deployment/tests/InstallerSelfTest.iss','deployment/tests/LifecycleProbe.iss','deployment/scripts/Build-Package.ps1','deployment/scripts/verify-package.py')) {
     $inputs += [ordered]@{path=$file; sha256=(Get-FileHash -LiteralPath (Join-Path $root $file) -Algorithm SHA256).Hash.ToLowerInvariant()}
 }
 $payloads = @()
@@ -90,6 +89,44 @@ foreach ($file in Get-ChildItem $stage -Recurse -File | Sort-Object FullName) {
 $manifest = [ordered]@{version=$version.version; sourceCommit=$head; applicationChanges=$changes; dotnetSdk=$version.dotnetSdk; innoSetup=$version.innoSetup; runtime='win-x64'; selfContained=$true; inputs=$inputs; files=$payloads}
 $manifest | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $deployment 'payload-manifest.json') -Encoding utf8
 Run-Native $Python @((Join-Path $PSScriptRoot 'verify-package.py'),'--stage',$stage,'--logo',(Join-Path $root 'AVCPublicAccess.Client/Images/avc-logo.png')) (Join-Path $work 'logs/stage-validation.log')
+
+# Execute only the build-host test harness: platform calls are compile-time
+# mocks, no elevation is requested, and this executable is never staged.
+$testOutput = Join-Path $work 'tests'
+$null = New-Item -ItemType Directory -Path $testOutput -Force
+$testArguments = @("/DTestOutputRoot=$(Compiler-Path $testOutput)",(Compiler-Path (Join-Path $root 'deployment/tests/InstallerSelfTest.iss')))
+$testExe = Join-Path $testOutput 'InstallerSelfTest.exe'
+$testReport = Join-Path $testOutput 'results.txt'
+if ($Wine) {
+    Run-Native $Wine (@((Compiler-Path $Iscc)) + $testArguments) (Join-Path $work 'logs/test-compile.log')
+    Run-Native $Wine @((Compiler-Path $testExe),'/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$(Compiler-Path $testReport)") (Join-Path $work 'logs/test-run.log')
+} else {
+    Run-Native $Iscc $testArguments (Join-Path $work 'logs/test-compile.log')
+    Run-Native $testExe @('/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$testReport") (Join-Path $work 'logs/test-run.log')
+}
+if (-not (Test-Path $testReport) -or (Get-Content $testReport -Raw) -notmatch '^PASS:') { throw 'Compiled installer tests did not pass.' }
+Get-Content $testReport | ForEach-Object { Write-Host $_ }
+
+# Exercise Inno's actual post-install event and GetCustomSetupExitCode, not just
+# a unit-level function call. Wine exposes Windows exit codes modulo 256.
+$probeArguments = @("/DTestOutputRoot=$(Compiler-Path $testOutput)",(Compiler-Path (Join-Path $root 'deployment/tests/LifecycleProbe.iss')))
+if ($Wine) {
+    Run-Native $Wine (@((Compiler-Path $Iscc)) + $probeArguments) (Join-Path $work 'logs/probe-compile.log')
+} else {
+    Run-Native $Iscc $probeArguments (Join-Path $work 'logs/probe-compile.log')
+}
+foreach ($failure in 0..9) {
+    $expectedExit = if ($failure -eq 0) { 0 } elseif ($Wine) { 1001 % 256 } else { 1001 }
+    $probeExe = Join-Path $testOutput 'LifecycleProbe.exe'
+    $probeArgs = @('/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/FAILURE=$failure")
+    $probeLog = Join-Path $work "logs/probe-$failure.log"
+    if ($Wine) {
+        Run-Native $Wine (@((Compiler-Path $probeExe)) + $probeArgs) $probeLog $expectedExit
+    } else {
+        Run-Native $probeExe $probeArgs $probeLog $expectedExit
+    }
+}
+'PASS: real Inno completion returned success only for verified deployment; all nine injected failures returned 1001.' | Set-Content (Join-Path $testOutput 'lifecycle-results.txt')
 
 $isccArguments = @("/DStageRoot=$(Compiler-Path $stage)","/DOutputRoot=$(Compiler-Path $output)","/DPackageVersion=$($version.version)",(Compiler-Path (Join-Path $root 'deployment/installer/AVCPublicAccess.iss')))
 if ($Wine) {

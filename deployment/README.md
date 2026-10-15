@@ -19,7 +19,7 @@ The Linux build additionally accepts `-Dotnet /path/to/dotnet -Wine /path/to/win
 
 Every invocation deletes only its own fixed `Build/Installer` directory and copies allowlisted **current tracked source files** into an empty source tree. It rejects unrelated application changes; the sole allowed installation-support edit is the Service hosting name. It freshly restores/publishes all three projects in Release, omits development settings/launch profiles and PDBs, verifies self-contained x64 executables and the exact PNG bytes in the Client DLL, generates a payload/input SHA256 manifest, compiles, and extracts the **actual installer**. All extracted payloads must match fresh staging byte for byte, with no missing/extra files; the actual embedded Inno installer/uninstaller engine is decompressed with block/engine CRC verification, and compiled header fields must confirm Uninstallable, ARP registration, AppId, publisher, version and x64 architecture. Configuration is checked against the reviewed credential-free source template. No Archive, FinalRelease, existing install, old publish, or old bin/obj outputs are inputs. Source commit and all input hashes make uncommitted installer/support changes traceable. This is repeatable fresh-input building, not a claim that timestamps/signatures produce identical installer hashes across runs.
 
-Output: `Build/Installer/output/AVCPublicAccess-Client-Setup-1.0.0-win-x64.exe`, `SHA256SUMS.txt`. Evidence: `Build/Installer/logs/`, `stage/Deployment/payload-manifest.json`, `extracted/`. Build output is ignored by Git. The package includes no databases, Server payload, certificates, passwords, access codes, development/source files, or backups. The one packaged PowerShell script is required runtime **installation support**, not application source. Treat the initial package as unsigned until a college code-signing certificate is selected; sign, verify, and rehash the final distributed installer. No certificate or secret belongs in this repository.
+Output: `Build/Installer/output/AVCPublicAccess-Client-Setup-1.0.0-win-x64.exe`, `SHA256SUMS.txt`. Evidence: `Build/Installer/logs/`, `stage/Deployment/payload-manifest.json`, `extracted/`. Build output is ignored by Git. The package includes no databases, Server payload, certificates, passwords, access codes, development/source files, or backups. Deployment runs as compiled Inno Setup code (`installer/NativeDeployment.iss` and the strict JSON parser in `installer/Json.iss`). No PowerShell script, shell wrapper, or additional deployment executable is installed or invoked. Institutional PowerShell `MachinePolicy=AllSigned` remains unchanged; signing capability is not a prerequisite for this design. Executable application-control policies are separate and still apply. No certificate or secret belongs in this repository.
 
 ## Installed layout and ownership
 
@@ -28,7 +28,7 @@ C:\Program Files\AVC\PublicAccess\
   AVCPublicAccess.Watchdog.exe + its self-contained runtime files
   Client\AVCPublicAccess.Client.exe + dependencies/resources
   Service\AVCPublicAccess.Service.exe + dependencies + appsettings.json
-  Deployment\Deployment.ps1 + payload-manifest.json
+  Deployment\payload-manifest.json
   unins000.exe + unins000.dat  (created by Inno Setup at installation)
 ```
 
@@ -87,3 +87,62 @@ Pilot: Server **MH109-04886**, Client **MH125-01182**. No deployment on either m
 4. While thawed, test controlled expiration/reboot and same-boot Service restart/recovery with safe test data, without clearing enforcement state. Verify independent Service expiration, real forced reboot and clean Available/no prior patron after boot and patron logon.
 5. Test an upgrade with a nondefault configured port and confirm preservation; test invalid address/ports, unreachable Server, Service startup failure, ownership collisions and saved-state blocking; confirm failed installs are clearly reported and remain thawed. Test generated uninstall and reinstall while thawed, actual SCM/task/ARP removal, retained config and unrelated files, and no Watchdog relaunch after uninstall.
 6. Reinstall/verify a clean no-session baseline, freeze, then test **FROZEN → patron session → expiration → Windows reboot → Deep Freeze restore → automatic Service + patron Watchdog/Client startup → Available/no prior patron**. Confirm frozen restoration preserves configured endpoint and baseline log ACL but discards patron state/log additions. Collect results externally before reboot if needed. No installer execution, reboot, or Deep Freeze test is claimed by static validation.
+
+## Stage 4A: native installer deployment
+
+`Deployment.ps1` is retained solely as a development reference. The installer and
+its generated uninstaller share compiled deployment code. SCM operations use
+Windows APIs; WMI COM queries enumerate Services/process candidates; process
+handles verify executable paths before termination. Task Scheduler COM verifies
+ownership and registers the existing least-privilege Builtin Users logon task.
+Protected runtime paths reject junctions/reparse points; explicit protected ACLs
+retain administrator/SYSTEM ownership and limit patron writes to watchdog.log.
+No shell, runtime PowerShell, policy changes, or credential storage is involved.
+
+The JSON parser is repository-owned RFC 8259 parsing code with depth/size limits,
+duplicate-key rejection, strict number/escape handling, and no evaluation. The
+endpoint update replaces only the parsed ServerAddress value token; other keys,
+whitespace, unknown settings, and numeric precision remain unchanged. Files must
+be valid UTF-8 (an existing BOM is preserved). Replacement is atomic and retains
+the original file security. Invalid configuration blocks servicing.
+
+Uninstall completes ownership/session preflight and ordered shutdown before
+allowing Inno to delete files. If state appears during Service shutdown, the
+existing Service is restarted and servicing aborts without clearing state.
+Uninstall retains configuration, ProgramData, runtime state and logs. Previously
+installed uninstallers retain their older behavior until a successful upgrade
+replaces them. Failure recovery is not transactional: review a stopped/disabled
+installation while thawed and do not freeze it.
+
+Build-Package compiles and executes `tests/InstallerSelfTest.iss` on the build
+host. This harness compiles the same JSON/safety logic with compile-time platform
+mocks, requests no elevation, and is never packaged. Test-Deployment retains the
+legacy reference fixtures and checks the native test report and integration.
+The normal installer is compiled and extracted but never executed on the build
+host. Real SCM, Task Scheduler, ACL, API, install/upgrade/uninstall, and AllSigned
+behavior require Windows 10/11 institutional pilot testing; mocked tests and
+Wine do not establish deployment approval. THAWED status remains an explicit
+administrator confirmation, not automated Deep Freeze detection.
+
+### Stage 4A review corrections
+
+Uninstall initialization is queries only. Guarded shutdown/registration removal
+runs at `usUninstall`, after Inno's final confirmation and before its file-removal
+phase; an exception propagates fatally. Cancelling either confirmation cannot
+remove registrations. The same preflight is repeated at the destructive boundary.
+
+`Lifecycle.iss` latches any required post-install failure, returns custom exit code
+1001, and the wizard displays FAILED / NOT VERIFIED / remain THAWED instead of
+normal success. No enforcement state is cleared and no rollback is promised.
+The build-host lifecycle probe runs through Inno's real completion path for nine
+injected failures and one verified success. Platform operations are mocks; probes
+request no elevation and are excluded from the payload. These tests complement,
+not replace, real Windows UI/cancellation, SCM, Task Scheduler, and ACL testing.
+
+Existing Watchdog tasks must match the action and full security/trigger/settings
+contract. Localized principal names resolve to the Builtin Users SID through
+Windows account APIs. Trigger/action kinds are checked using registered task XML
+with DTDs/external entities disabled. Task definition is read back after creation.
+Only this installer's own deliberate shutdown phase permits a disabled task;
+a previously disabled or drifted task fails closed and requires administrator
+review before retrying. Ownership/security mismatches are never silently repaired.

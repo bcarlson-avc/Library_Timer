@@ -147,8 +147,8 @@ def main():
         path = stage / relative
         require(not any(x.lower() in {'archive', 'finalrelease', 'bin', 'obj', 'publish', 'server'} for x in path.relative_to(stage).parts), 'Forbidden path')
         require(path.suffix.lower() not in {'.db', '.sqlite', '.sqlite3', '.mdf', '.ldf', '.pdb', '.cs', '.csproj', '.xaml', '.bak', '.old', '.zip', '.pfx', '.pem', '.key'}, f'Forbidden file: {relative}')
-        require(path.suffix.lower() in {'.exe', '.dll', '.json', '.ps1'}, f'Unreviewed payload: {relative}')
-        require(path.suffix.lower() != '.ps1' or relative == 'Deployment/Deployment.ps1', 'Unexpected deployment script')
+        require(path.suffix.lower() in {'.exe', '.dll', '.json'}, f'Unreviewed payload: {relative}')
+        require(path.name.lower() != 'deployment.ps1', 'Runtime PowerShell helper is forbidden')
         if path.name.startswith('appsettings'):
             require(relative in allowed_config, 'Unexpected application configuration')
         require(digest(path) == entry['sha256'] and path.stat().st_size == entry['bytes'], f'Staging hash mismatch: {relative}')
