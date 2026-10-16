@@ -1,3 +1,5 @@
+#include "ComDiagnostics.iss"
+
 // Privileged deployment is compiled into Setup and its generated uninstaller.
 // No command shell, PowerShell host, script evaluation, or external helper.
 const
@@ -124,8 +126,8 @@ begin Result := ExpandConstant('{commonappdata}\AVC\PublicAccess'); end;
 function Wmi: Variant;
 var Locator: Variant;
 begin
-  Locator := CreateOleObject('WbemScripting.SWbemLocator');
-  Result := Locator.ConnectServer('', 'root\cimv2');
+  Locator := DiagnosticCreate('WbemScripting.SWbemLocator');
+  Result := ComCall(Locator, 'Deployment.Wmi.ConnectServer', ['', 'root\cimv2']);
 end;
 
 function ServiceHandle(Access: LongWord): THandle;
@@ -200,24 +202,46 @@ begin
 #endif
   Expected := '"' + DeploymentRoot + '\Service\AVCPublicAccess.Service.exe"';
   Connection := Wmi;
-  Services := Connection.ExecQuery('SELECT Name,DisplayName,PathName FROM Win32_Service');
-  for I := 0 to Services.Count - 1 do begin
-    S := Services.ItemIndex(I);
-    if CompareText(String(S.Name), AVCService) = 0 then
-      Require(OwnedServiceMatches(String(S.PathName), DeploymentRoot), 'Service belongs to another installation.')
+  Services := ComCall(Connection, 'Deployment.Wmi.Services.ExecQuery', ['SELECT Name,DisplayName,PathName FROM Win32_Service']);
+  for I := 0 to ComGet(Services, 'Deployment.Wmi.Services.Count') - 1 do begin
+    S := ComCall(Services, 'Deployment.Wmi.Services.ItemIndex', [I]);
+    if CompareText(String(ComGet(S, 'Deployment.Wmi.Service.Name')), AVCService) = 0 then
+      Require(OwnedServiceMatches(String(ComGet(S, 'Deployment.Wmi.Service.PathName')), DeploymentRoot), 'Service belongs to another installation.')
     else
-      Require(not LegacyService(String(S.Name), String(S.DisplayName), String(S.PathName)),
+      Require(not LegacyService(String(ComGet(S, 'Deployment.Wmi.Service.Name')), String(ComGet(S, 'Deployment.Wmi.Service.DisplayName')), String(ComGet(S, 'Deployment.Wmi.Service.PathName'))),
         'Legacy AVC Service exists; review migration before servicing.');
   end;
   // Also query SCM: WMI/query failures must never be interpreted as absence.
   I := ServiceState;
 end;
 
+#ifdef WatchdogIntegrationProbe
+var DisposableWatchdogName: String;
+#endif
+function WatchdogTaskName: String;
+begin
+#ifdef WatchdogIntegrationProbe
+  Require((Pos('AVC-Installer-Probe-', DisposableWatchdogName) = 1) and
+    (Length(DisposableWatchdogName) > 30) and (CompareText(DisposableWatchdogName, AVCTask) <> 0),
+    'Disposable probe task name is invalid; production task access forbidden.');
+  Result := DisposableWatchdogName;
+#else
+  Result := AVCTask;
+#endif
+end;
+
+procedure WatchdogComparison(const Name: String; Matches: Boolean);
+begin
+  BeginComOperation('Watchdog ownership comparison: ' + Name);
+  if Matches then Log('MATCH ' + Name) else Log('MISMATCH ' + Name);
+end;
+
 function TaskFolder: Variant;
 var Scheduler: Variant;
 begin
-  Scheduler := CreateOleObject('Schedule.Service'); Scheduler.Connect;
-  Result := Scheduler.GetFolder('\');
+  Scheduler := DiagnosticCreate('Schedule.Service');
+  ComCall(Scheduler, 'Watchdog.Scheduler.Connect', []);
+  Result := ComCall(Scheduler, 'Watchdog.Scheduler.GetFolder', ['\']);
 end;
 
 function OwnedTaskMatches(Count: Integer; const Path, Arguments, Directory, Root: String): Boolean;
@@ -231,7 +255,8 @@ function IsPatronGroup(const Group: String): Boolean;
 var Actual, Expected: TSidBuffer; Size, ExpectedSize, DomainSize, Use: LongWord;
   Domain: String;
 begin
-  if Group = 'S-1-5-32-545' then begin Result := True; Exit; end;
+  BeginComOperation('Watchdog principal SID verification');
+  if Group = 'S-1-5-32-545' then begin Log('MATCH Builtin Users SID'); Result := True; Exit; end;
   // Task Scheduler may return a localized account name rather than a SID.
   // Resolve it through Windows and compare binary SIDs, never English names.
   Size := SizeOf(Actual); ExpectedSize := SizeOf(Expected);
@@ -239,84 +264,121 @@ begin
   Require(LookupAccountName(0, Group, Actual, Size, Domain, DomainSize, Use), 'Cannot establish Watchdog principal SID.');
   Require(CreateWellKnownSid(27, 0, Expected, ExpectedSize), 'Cannot establish Builtin Users SID.');
   Result := EqualSid(Actual, Expected);
+  WatchdogComparison('resolved Builtin Users SID', Result);
+end;
+
+function WatchdogCondition(const Name: String; Matches: Boolean): Boolean;
+begin
+  WatchdogComparison(Name, Matches); Result := Matches;
 end;
 
 function WatchdogDefinitionMatches(const D: TWatchdogDefinition; AllowDisabled: Boolean): Boolean;
 begin
-  Result := (D.PrincipalId = 'Patron') and (D.ActionContext = 'Patron') and
-    (D.UserId = '') and (D.GroupSid = 'S-1-5-32-545') and
-    (D.LogonType = 4) and (D.RunLevel = 0) and
-    (D.TriggerCount = 1) and D.LogonTrigger and D.TriggerEnabled and
-    (D.TriggerUser = '') and (D.StartBoundary = '') and (D.EndBoundary = '') and
-    ((D.Delay = '') or (D.Delay = 'PT0S')) and
-    (D.RepetitionInterval = '') and (D.RepetitionDuration = '') and not D.RepetitionStop and
-    ((D.TriggerLimit = '') or (D.TriggerLimit = 'PT0S')) and
-    (D.TaskEnabled or AllowDisabled) and (D.MultipleInstances = 2) and
-    not D.DisallowBattery and not D.StopOnBattery and D.StartWhenAvailable and
-    (D.ExecutionLimit = 'PT0S') and (D.RestartInterval = 'PT1M') and (D.RestartCount = 3) and
-    not D.RunOnlyIdle and not D.RunOnlyNetwork and not D.Hidden and D.AllowDemand and D.AllowTerminate;
+  Result := WatchdogCondition('PrincipalId', (D.PrincipalId = 'Patron')) and
+    WatchdogCondition('ActionContext', (D.ActionContext = 'Patron')) and
+    WatchdogCondition('UserId', (D.UserId = '')) and
+    WatchdogCondition('GroupSid', (D.GroupSid = 'S-1-5-32-545')) and
+    WatchdogCondition('LogonType', (D.LogonType = 4)) and
+    WatchdogCondition('RunLevel', (D.RunLevel = 0)) and
+    WatchdogCondition('TriggerCount', (D.TriggerCount = 1)) and
+    WatchdogCondition('LogonTrigger', D.LogonTrigger) and
+    WatchdogCondition('TriggerEnabled', D.TriggerEnabled) and
+    WatchdogCondition('TriggerUser', (D.TriggerUser = '')) and
+    WatchdogCondition('StartBoundary', (D.StartBoundary = '')) and
+    WatchdogCondition('EndBoundary', (D.EndBoundary = '')) and
+    WatchdogCondition('Delay', ((D.Delay = '') or (D.Delay = 'PT0S'))) and
+    WatchdogCondition('RepetitionInterval', (D.RepetitionInterval = '')) and
+    WatchdogCondition('RepetitionDuration', (D.RepetitionDuration = '')) and
+    WatchdogCondition('RepetitionStop', not D.RepetitionStop) and
+    WatchdogCondition('TriggerLimit', ((D.TriggerLimit = '') or (D.TriggerLimit = 'PT0S'))) and
+    WatchdogCondition('TaskEnabled', (D.TaskEnabled or AllowDisabled)) and
+    WatchdogCondition('MultipleInstances', (D.MultipleInstances = 2)) and
+    WatchdogCondition('DisallowBattery', not D.DisallowBattery) and
+    WatchdogCondition('StopOnBattery', not D.StopOnBattery) and
+    WatchdogCondition('StartWhenAvailable', D.StartWhenAvailable) and
+    WatchdogCondition('ExecutionLimit', (D.ExecutionLimit = 'PT0S')) and
+    WatchdogCondition('RestartInterval', (D.RestartInterval = 'PT1M')) and
+    WatchdogCondition('RestartCount', (D.RestartCount = 3)) and
+    WatchdogCondition('RunOnlyIdle', not D.RunOnlyIdle) and
+    WatchdogCondition('RunOnlyNetwork', not D.RunOnlyNetwork) and
+    WatchdogCondition('Hidden', not D.Hidden) and
+    WatchdogCondition('AllowDemand', D.AllowDemand) and
+    WatchdogCondition('AllowTerminate', D.AllowTerminate);
 end;
 
 procedure VerifyWatchdogDefinition(const Task: Variant);
 var Definition, Principal, Triggers, Trigger, Settings, Xml: Variant;
   D: TWatchdogDefinition;
 begin
-  Definition := Task.Definition; Principal := Definition.Principal;
-  Triggers := Definition.Triggers; Settings := Definition.Settings;
-  Require(Triggers.Count = 1, 'Watchdog must have exactly one trigger.');
+  Definition := ComGet(Task, 'Watchdog.Task.Definition'); Principal := ComGet(Definition, 'Watchdog.Definition.Principal');
+  Triggers := ComGet(Definition, 'Watchdog.Definition.Triggers'); Settings := ComGet(Definition, 'Watchdog.Definition.Settings');
+  WatchdogComparison('exactly one trigger', ComGet(Triggers, 'Watchdog.Triggers.Count') = 1);
+  Require(ComGet(Triggers, 'Watchdog.Triggers.Count') = 1, 'Watchdog must have exactly one trigger.');
   // Type is a Pascal reserved word. Verify the trigger/action types through
   // the registered XML before accessing type-specific COM properties.
-  Xml := CreateOleObject('Msxml2.DOMDocument.6.0');
-  Xml.async := False; Xml.resolveExternals := False; Xml.validateOnParse := False;
-  Xml.setProperty('ProhibitDTD', True);
-  Xml.setProperty('SelectionNamespaces', 'xmlns:t="http://schemas.microsoft.com/windows/2004/02/mit/task"');
-  Require(Xml.loadXML(String(Task.Xml)), 'Cannot parse registered Watchdog definition.');
-  Require((Xml.selectNodes('/t:Task/t:Triggers/t:LogonTrigger').length = 1) and
-    (Xml.selectNodes('/t:Task/t:Actions/t:Exec').length = 1), 'Unexpected Watchdog trigger/action type.');
-  Trigger := Triggers.Item(1);
-  D.PrincipalId := Principal.Id; D.ActionContext := Definition.Actions.Context;
-  D.UserId := Principal.UserId; D.GroupSid := '';
-  if IsPatronGroup(String(Principal.GroupId)) then D.GroupSid := 'S-1-5-32-545';
-  D.LogonType := Principal.LogonType; D.RunLevel := Principal.RunLevel;
-  D.TriggerCount := Triggers.Count; D.LogonTrigger := True;
-  D.TriggerEnabled := Trigger.Enabled; D.TriggerUser := Trigger.UserId;
-  D.StartBoundary := Trigger.StartBoundary; D.EndBoundary := Trigger.EndBoundary;
-  D.Delay := Trigger.Delay; D.TriggerLimit := '';
-  if Xml.selectNodes('/t:Task/t:Triggers/t:LogonTrigger/t:ExecutionTimeLimit').length <> 0 then
-    D.TriggerLimit := Xml.selectSingleNode('/t:Task/t:Triggers/t:LogonTrigger/t:ExecutionTimeLimit').text;
-  D.RepetitionInterval := Trigger.Repetition.Interval;
-  D.RepetitionDuration := Trigger.Repetition.Duration;
-  D.RepetitionStop := Trigger.Repetition.StopAtDurationEnd;
-  D.TaskEnabled := Task.Enabled and Settings.Enabled;
-  D.MultipleInstances := Settings.MultipleInstances;
-  D.DisallowBattery := Settings.DisallowStartIfOnBatteries;
-  D.StopOnBattery := Settings.StopIfGoingOnBatteries;
-  D.StartWhenAvailable := Settings.StartWhenAvailable;
-  D.ExecutionLimit := Settings.ExecutionTimeLimit;
-  D.RestartInterval := Settings.RestartInterval; D.RestartCount := Settings.RestartCount;
-  D.RunOnlyIdle := Settings.RunOnlyIfIdle; D.RunOnlyNetwork := Settings.RunOnlyIfNetworkAvailable;
-  D.Hidden := Settings.Hidden; D.AllowDemand := Settings.AllowDemandStart;
-  D.AllowTerminate := Settings.AllowHardTerminate;
+  Xml := DiagnosticCreate('Msxml2.DOMDocument.6.0');
+  ComSet(Xml, 'Watchdog.Xml.async', False); ComSet(Xml, 'Watchdog.Xml.resolveExternals', False); ComSet(Xml, 'Watchdog.Xml.validateOnParse', False);
+  ComCall(Xml, 'Watchdog.Xml.ProhibitDTD.setProperty', ['ProhibitDTD', True]);
+  ComCall(Xml, 'Watchdog.Xml.SelectionNamespaces.setProperty', ['SelectionNamespaces', 'xmlns:t="http://schemas.microsoft.com/windows/2004/02/mit/task"']);
+  Require(ComCall(Xml, 'Watchdog.Xml.loadXML', [String(ComGet(Task, 'Watchdog.Task.Xml'))]), 'Cannot parse registered Watchdog definition.');
+  Require((ComGet(ComCall(Xml, 'Watchdog.Xml.LogonTrigger.selectNodes', ['/t:Task/t:Triggers/t:LogonTrigger']), 'Watchdog.Xml.Nodes.length') = 1) and
+    (ComGet(ComCall(Xml, 'Watchdog.Xml.ExecAction.selectNodes', ['/t:Task/t:Actions/t:Exec']), 'Watchdog.Xml.Nodes.length') = 1), 'Unexpected Watchdog trigger/action type.');
+  Trigger := ComCall(Triggers, 'Watchdog.Triggers.Item', [1]);
+  D.PrincipalId := ComGet(Principal, 'Watchdog.Principal.Id'); D.ActionContext := ComGet(ComGet(Definition, 'Watchdog.Definition.Actions'), 'Watchdog.Actions.Context');
+  D.UserId := ComGet(Principal, 'Watchdog.Principal.UserId'); D.GroupSid := '';
+  if IsPatronGroup(String(ComGet(Principal, 'Watchdog.Principal.GroupId'))) then D.GroupSid := 'S-1-5-32-545';
+  D.LogonType := ComGet(Principal, 'Watchdog.Principal.LogonType'); D.RunLevel := ComGet(Principal, 'Watchdog.Principal.RunLevel');
+  D.TriggerCount := ComGet(Triggers, 'Watchdog.Triggers.Count'); D.LogonTrigger := True;
+  D.TriggerEnabled := ComGet(Trigger, 'Watchdog.Trigger.Enabled'); D.TriggerUser := ComGet(Trigger, 'Watchdog.Trigger.UserId');
+  D.StartBoundary := ComGet(Trigger, 'Watchdog.Trigger.StartBoundary'); D.EndBoundary := ComGet(Trigger, 'Watchdog.Trigger.EndBoundary');
+  D.Delay := ComGet(Trigger, 'Watchdog.Trigger.Delay'); D.TriggerLimit := '';
+  if ComGet(ComCall(Xml, 'Watchdog.Xml.selectNodes', ['/t:Task/t:Triggers/t:LogonTrigger/t:ExecutionTimeLimit']), 'Watchdog.Xml.Nodes.length') <> 0 then
+    D.TriggerLimit := ComGet(ComCall(Xml, 'Watchdog.Xml.selectSingleNode', ['/t:Task/t:Triggers/t:LogonTrigger/t:ExecutionTimeLimit']), 'Watchdog.Xml.Node.text');
+  D.RepetitionInterval := ComGet(ComGet(Trigger, 'Watchdog.Trigger.Repetition'), 'Watchdog.Repetition.Interval');
+  D.RepetitionDuration := ComGet(ComGet(Trigger, 'Watchdog.Trigger.Repetition'), 'Watchdog.Repetition.Duration');
+  D.RepetitionStop := ComGet(ComGet(Trigger, 'Watchdog.Trigger.Repetition'), 'Watchdog.Repetition.StopAtDurationEnd');
+  D.TaskEnabled := ComGet(Task, 'Watchdog.Task.Enabled') and ComGet(Settings, 'Watchdog.Settings.Enabled');
+  D.MultipleInstances := ComGet(Settings, 'Watchdog.Settings.MultipleInstances');
+  D.DisallowBattery := ComGet(Settings, 'Watchdog.Settings.DisallowStartIfOnBatteries');
+  D.StopOnBattery := ComGet(Settings, 'Watchdog.Settings.StopIfGoingOnBatteries');
+  D.StartWhenAvailable := ComGet(Settings, 'Watchdog.Settings.StartWhenAvailable');
+  D.ExecutionLimit := ComGet(Settings, 'Watchdog.Settings.ExecutionTimeLimit');
+  D.RestartInterval := ComGet(Settings, 'Watchdog.Settings.RestartInterval'); D.RestartCount := ComGet(Settings, 'Watchdog.Settings.RestartCount');
+  D.RunOnlyIdle := ComGet(Settings, 'Watchdog.Settings.RunOnlyIfIdle'); D.RunOnlyNetwork := ComGet(Settings, 'Watchdog.Settings.RunOnlyIfNetworkAvailable');
+  D.Hidden := ComGet(Settings, 'Watchdog.Settings.Hidden'); D.AllowDemand := ComGet(Settings, 'Watchdog.Settings.AllowDemandStart');
+  D.AllowTerminate := ComGet(Settings, 'Watchdog.Settings.AllowHardTerminate');
   Require(WatchdogDefinitionMatches(D, WatchdogDisabledByInstaller), 'Watchdog principal, trigger, or settings do not match this installation.');
 end;
 
 function OwnedTask: Variant;
-var Folder, Tasks, Task, Actions, Action: Variant; I: Integer;
+var Folder, Tasks, Task, Actions, Action: Variant; I, Count: Integer;
+  NameMatches: Boolean; ActionPath, Arguments, Directory: String;
 begin
   Result := Unassigned;
 #ifdef DeploymentTest
   Require(not MockQueryError, 'Mock task query failure.'); Exit;
 #endif
-  Folder := TaskFolder; Tasks := Folder.GetTasks(1); // include hidden tasks
-  for I := 1 to Tasks.Count do begin
-    Task := Tasks.Item(I);
-    if CompareText(String(Task.Name), AVCTask) = 0 then begin
-      Actions := Task.Definition.Actions;
-      Require(Actions.Count = 1, 'Watchdog task has unexpected actions.');
-      Action := Actions.Item(1);
+  Folder := TaskFolder; Tasks := ComCall(Folder, 'Watchdog.Folder.GetTasks', [1]); // include hidden tasks
+  for I := 1 to ComGet(Tasks, 'Watchdog.Tasks.Count') do begin
+    Task := ComCall(Tasks, 'Watchdog.Tasks.Item', [I]);
+    NameMatches := CompareText(String(ComGet(Task, 'Watchdog.Task.Name')), WatchdogTaskName) = 0;
+    WatchdogComparison('task enumeration candidate name', NameMatches);
+    if NameMatches then begin
+      WatchdogComparison('exact task name', True);
+      Actions := ComGet(ComGet(Task, 'Watchdog.Task.Definition'), 'Watchdog.Definition.Actions');
+      Count := ComGet(Actions, 'Watchdog.Actions.Count');
+      WatchdogComparison('single action', Count = 1);
+      Require(Count = 1, 'Watchdog task has unexpected actions.');
+      Action := ComCall(Actions, 'Watchdog.Actions.Item', [1]);
       // Non-exec actions have no Path/Arguments: COM access fails closed.
-      Require(OwnedTaskMatches(Actions.Count, String(Action.Path), String(Action.Arguments),
-        String(Action.WorkingDirectory), DeploymentRoot),
+      Count := ComGet(Actions, 'Watchdog.Actions.Count');
+      ActionPath := ComGet(Action, 'Watchdog.Action.Path');
+      Arguments := ComGet(Action, 'Watchdog.Action.Arguments');
+      Directory := ComGet(Action, 'Watchdog.Action.WorkingDirectory');
+      WatchdogComparison('executable path', CompareText(ActionPath, DeploymentRoot + '\AVCPublicAccess.Watchdog.exe') = 0);
+      WatchdogComparison('empty arguments', Arguments = '');
+      WatchdogComparison('working directory', CompareText(Directory, DeploymentRoot) = 0);
+      Require(OwnedTaskMatches(Count, ActionPath, Arguments, Directory, DeploymentRoot),
         'Watchdog task belongs to another installation.');
       VerifyWatchdogDefinition(Task);
       Result := Task;
@@ -343,13 +405,15 @@ begin
 #ifdef DeploymentTest
   Require(not MockApiError, 'Mock API failure.'); Result := not MockActive; Exit;
 #endif
-  Request := CreateOleObject('WinHttp.WinHttpRequest.5.1');
-  Request.SetProxy(1); // fixed loopback API must never use a proxy
-  Request.SetTimeouts(2000, 2000, 2000, 2000);
-  Request.SetAutoLogonPolicy(2); Request.Option(6) := False;
-  Request.Open('GET', 'http://127.0.0.1:5051/status', False); Request.Send;
-  Require(Request.Status = 200, 'AVC local API did not return success.');
-  Result := StatusAvailable(String(Request.ResponseText), Production);
+  Request := DiagnosticCreate('WinHttp.WinHttpRequest.5.1');
+  ComCall(Request, 'Deployment.LocalApi.SetProxy', [1]); // fixed loopback API must never use a proxy
+  ComCall(Request, 'Deployment.LocalApi.SetTimeouts', [2000, 2000, 2000, 2000]);
+  ComCall(Request, 'Deployment.LocalApi.SetAutoLogonPolicy', [2]);
+  ComSetIndexed(Request, 'Deployment.LocalApi.Option', 6, False);
+  ComCall(Request, 'Deployment.LocalApi.Open', ['GET', 'http://127.0.0.1:5051/status', False]);
+  ComCall(Request, 'Deployment.LocalApi.Send', []);
+  Require(ComGet(Request, 'Deployment.LocalApi.Status') = 200, 'AVC local API did not return success.');
+  Result := StatusAvailable(String(ComGet(Request, 'Deployment.LocalApi.ResponseText')), Production);
 end;
 
 procedure AssertNoPatronState;
@@ -387,13 +451,13 @@ begin
   Exit;
 #endif
   Connection := Wmi;
-  Processes := Connection.ExecQuery('SELECT ProcessId,Name FROM Win32_Process WHERE Name="AVCPublicAccess.Watchdog.exe" OR Name="AVCPublicAccess.Client.exe"');
-  for I := 0 to Processes.Count - 1 do begin
-    P := Processes.ItemIndex(I);
+  Processes := ComCall(Connection, 'Deployment.Wmi.Processes.ExecQuery', ['SELECT ProcessId,Name FROM Win32_Process WHERE Name="AVCPublicAccess.Watchdog.exe" OR Name="AVCPublicAccess.Client.exe"']);
+  for I := 0 to ComGet(Processes, 'Deployment.Wmi.Processes.Count') - 1 do begin
+    P := ComCall(Processes, 'Deployment.Wmi.Processes.ItemIndex', [I]);
     Expected := DeploymentRoot + '\AVCPublicAccess.Watchdog.exe';
-    if CompareText(String(P.Name), 'AVCPublicAccess.Client.exe') = 0 then
+    if CompareText(String(ComGet(P, 'Deployment.Wmi.Process.Name')), 'AVCPublicAccess.Client.exe') = 0 then
       Expected := DeploymentRoot + '\Client\AVCPublicAccess.Client.exe';
-    H := OpenProcess($100000 or $1000 or 1, False, P.ProcessId);
+    H := OpenProcess($100000 or $1000 or 1, False, ComGet(P, 'Deployment.Wmi.Process.ProcessId'));
     Require(H <> 0, 'Cannot inspect an AVC process; servicing aborted.');
     try
       SetLength(Image, 32768); Size := Length(Image);
@@ -426,12 +490,13 @@ end;
 procedure StopDeployment;
 var Task: Variant; WasRunning: Boolean;
 begin
+  BeginDeploymentPhase('Ordered deployment shutdown');
   DeploymentPreflight;
   Task := OwnedTask;
   if not VarIsEmpty(Task) then begin
-    Task.Enabled := False;
+    ComSet(Task, 'Watchdog.Task.Enabled', False);
     WatchdogDisabledByInstaller := True; // permit only our own deliberate disabled phase
-    Task.Stop(0);
+    ComCall(Task, 'Watchdog.Task.Stop', [0]);
   end;
   StopOwnedProcesses;
   AssertNoPatronState; // after closing UI: reject an in-flight redemption
@@ -523,35 +588,51 @@ begin
 end;
 
 procedure RegisterWatchdog;
-var Scheduler, Folder, Definition, Principal, Trigger, Action, Task: Variant;
+var Scheduler, Folder, Definition, Principal, Trigger, Action, Task, Settings, Actions: Variant;
 begin
+  BeginDeploymentPhase('Watchdog ownership preflight');
   Task := OwnedTask;
-  Scheduler := CreateOleObject('Schedule.Service'); Scheduler.Connect;
-  Folder := Scheduler.GetFolder('\'); Definition := Scheduler.NewTask(0);
-  Definition.RegistrationInfo.Description := 'AVC Public Access patron-session Watchdog';
-  Principal := Definition.Principal; Principal.GroupId := 'S-1-5-32-545';
-  Principal.Id := 'Patron'; Definition.Actions.Context := 'Patron';
-  Principal.LogonType := 4; Principal.RunLevel := 0;
-  Trigger := Definition.Triggers.Create(9); Trigger.Enabled := True;
-  Trigger.ExecutionTimeLimit := 'PT0S';
-  Definition.Settings.MultipleInstances := 2;
-  Definition.Settings.DisallowStartIfOnBatteries := False;
-  Definition.Settings.StopIfGoingOnBatteries := False;
-  Definition.Settings.StartWhenAvailable := True;
-  Definition.Settings.Enabled := True;
-  Definition.Settings.ExecutionTimeLimit := 'PT0S';
-  Definition.Settings.RestartInterval := 'PT1M'; Definition.Settings.RestartCount := 3;
-  Definition.Settings.RunOnlyIfIdle := False;
-  Definition.Settings.RunOnlyIfNetworkAvailable := False;
-  Definition.Settings.Hidden := False;
-  Definition.Settings.AllowDemandStart := True;
-  Definition.Settings.AllowHardTerminate := True;
-  Action := Definition.Actions.Create(0);
-  Action.Path := DeploymentRoot + '\AVCPublicAccess.Watchdog.exe';
-  Action.WorkingDirectory := DeploymentRoot;
-  Task := Folder.RegisterTaskDefinition(AVCTask, Definition, 6, 'S-1-5-32-545', '', 4);
+  BeginDeploymentPhase('Watchdog task construction');
+  Scheduler := DiagnosticCreate('Schedule.Service');
+  ComCall(Scheduler, 'Watchdog.Scheduler.Connect', []);
+  Folder := ComCall(Scheduler, 'Watchdog.Scheduler.GetFolder', ['\']);
+  Definition := ComCall(Scheduler, 'Watchdog.Scheduler.NewTask', [0]);
+  ComSet(ComGet(Definition, 'Watchdog.Definition.RegistrationInfo'), 'Watchdog.RegistrationInfo.Description', 'AVC Public Access patron-session Watchdog');
+  Principal := ComGet(Definition, 'Watchdog.Definition.Principal');
+  ComSet(Principal, 'Watchdog.Principal.GroupId', 'S-1-5-32-545');
+  ComSet(Principal, 'Watchdog.Principal.Id', 'Patron');
+  Actions := ComGet(Definition, 'Watchdog.Definition.Actions');
+  ComSet(Actions, 'Watchdog.Actions.Context', 'Patron');
+  ComSet(Principal, 'Watchdog.Principal.LogonType', 4);
+  ComSet(Principal, 'Watchdog.Principal.RunLevel', 0);
+  Trigger := ComCall(ComGet(Definition, 'Watchdog.Definition.Triggers'), 'Watchdog.Triggers.Create', [9]);
+  ComSet(Trigger, 'Watchdog.Trigger.Enabled', True);
+  ComSet(Trigger, 'Watchdog.Trigger.ExecutionTimeLimit', 'PT0S');
+  Settings := ComGet(Definition, 'Watchdog.Definition.Settings');
+  ComSet(Settings, 'Watchdog.Settings.MultipleInstances', 2);
+  ComSet(Settings, 'Watchdog.Settings.DisallowStartIfOnBatteries', False);
+  ComSet(Settings, 'Watchdog.Settings.StopIfGoingOnBatteries', False);
+  ComSet(Settings, 'Watchdog.Settings.StartWhenAvailable', True);
+  ComSet(Settings, 'Watchdog.Settings.Enabled', True);
+  ComSet(Settings, 'Watchdog.Settings.ExecutionTimeLimit', 'PT0S');
+  ComSet(Settings, 'Watchdog.Settings.RestartInterval', 'PT1M');
+  ComSet(Settings, 'Watchdog.Settings.RestartCount', 3);
+  ComSet(Settings, 'Watchdog.Settings.RunOnlyIfIdle', False);
+  ComSet(Settings, 'Watchdog.Settings.RunOnlyIfNetworkAvailable', False);
+  ComSet(Settings, 'Watchdog.Settings.Hidden', False);
+  ComSet(Settings, 'Watchdog.Settings.AllowDemandStart', True);
+  ComSet(Settings, 'Watchdog.Settings.AllowHardTerminate', True);
+  Action := ComCall(Actions, 'Watchdog.Actions.Create', [0]);
+  ComSet(Action, 'Watchdog.Action.Path', DeploymentRoot + '\AVCPublicAccess.Watchdog.exe');
+  ComSet(Action, 'Watchdog.Action.WorkingDirectory', DeploymentRoot);
+  // Preserve the existing unset/empty arguments, without adding a setter.
+  WatchdogComparison('construction: default empty arguments', String(ComGet(Action, 'Watchdog.Action.Arguments')) = '');
+  BeginDeploymentPhase('Watchdog task registration');
+  Task := ComCall(Folder, 'Watchdog.Folder.RegisterTaskDefinition', [WatchdogTaskName, Definition, 6, 'S-1-5-32-545', '', 4]);
   WatchdogDisabledByInstaller := False;
+  BeginDeploymentPhase('Watchdog registered-task readback');
   Task := OwnedTask;
+  WatchdogComparison('registered task present', not VarIsEmpty(Task));
   Require(not VarIsEmpty(Task), 'Registered Watchdog could not be read back.');
 end;
 
@@ -571,8 +652,13 @@ begin
   Require(MockPostFailure <> 9, 'Mock required query failure.');
   Exit;
 #endif
-  DeploymentPreflight; WriteEndpoint(Endpoint); InitializeRuntime;
-  RegisterService; RegisterWatchdog; StartOwnedService;
+  BeginDeploymentPhase('Post-install preflight'); DeploymentPreflight;
+  BeginDeploymentPhase('Configuration update'); WriteEndpoint(Endpoint);
+  BeginDeploymentPhase('Runtime security initialization'); InitializeRuntime;
+  BeginDeploymentPhase('Service registration'); RegisterService;
+  RegisterWatchdog;
+  BeginDeploymentPhase('Service startup'); StartOwnedService;
+  BeginDeploymentPhase('Local API readiness');
   Ready := False; Deadline := TickCount + 30000;
   repeat
     try Ready := LocalStatus(True) and (ServiceState = 4); except Ready := False; end;
@@ -608,7 +694,7 @@ begin
   MockRegistrationsRemoved := True; Exit;
 #endif
   StopDeployment; Task := OwnedTask;
-  if not VarIsEmpty(Task) then begin Folder := TaskFolder; Folder.DeleteTask(AVCTask, 0); end;
+  if not VarIsEmpty(Task) then begin Folder := TaskFolder; ComCall(Folder, 'Watchdog.Folder.DeleteTask', [WatchdogTaskName, 0]); end;
   AssertOwnedService; H := ServiceHandle($10000);
   if H <> 0 then begin
     try Require(DeleteService(H), 'Cannot delete AVC Service.');

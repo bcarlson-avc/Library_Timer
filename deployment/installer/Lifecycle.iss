@@ -11,12 +11,13 @@ begin
   if InstallAttempted then Exit; // a failed attempt cannot later become success
   InstallAttempted := True; InstallVerified := False; InstallFailed := True;
   try
+    BeginDeploymentPhase('Post-install deployment');
     InstallDeployment(Endpoint);
     InstallVerified := True; InstallFailed := False;
   except
     // Keep the failure latch even though Setup continues after ssPostInstall.
     Log(UnverifiedNotice);
-    Log('Required deployment operation failed: ' + GetExceptionMessage);
+    Log('Required deployment operation failed: ' + DiagnosticFailure(GetExceptionMessage));
   end;
 end;
 
@@ -37,6 +38,7 @@ begin
 #endif
   try
     // Inno has not shown its final uninstall confirmation yet. Queries only.
+    BeginDeploymentPhase('Uninstall preflight');
     DeploymentPreflight;
     Result := True;
   except

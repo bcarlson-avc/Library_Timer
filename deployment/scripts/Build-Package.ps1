@@ -110,7 +110,7 @@ foreach ($name in @('Client','Service','Watchdog')) {
 }
 $deployment = Join-Path $stage 'Deployment'
 $null = New-Item -ItemType Directory -Path $deployment
-foreach ($file in @('deployment/version.json','deployment/installer/AVCPublicAccess.iss','deployment/installer/Endpoint.iss','deployment/installer/Json.iss','deployment/installer/NativeDeployment.iss','deployment/installer/Lifecycle.iss','deployment/tests/InstallerSelfTest.iss','deployment/tests/LifecycleProbe.iss','deployment/scripts/Build-Package.ps1','deployment/scripts/verify-package.py')) {
+foreach ($file in @('deployment/version.json','deployment/installer/AVCPublicAccess.iss','deployment/installer/Endpoint.iss','deployment/installer/Json.iss','deployment/installer/NativeDeployment.iss','deployment/installer/ComDiagnostics.iss','deployment/installer/Lifecycle.iss','deployment/tests/InstallerSelfTest.iss','deployment/tests/LifecycleProbe.iss','deployment/tests/ComDiagnosticsTest.iss','deployment/tests/WatchdogTaskProbe.iss','deployment/scripts/Build-Package.ps1','deployment/scripts/verify-package.py')) {
     $inputs += [ordered]@{path=$file; sha256=(Get-FileHash -LiteralPath (Join-Path $root $file) -Algorithm SHA256).Hash.ToLowerInvariant()}
 }
 $payloads = @()
@@ -158,6 +158,44 @@ foreach ($failure in 0..9) {
     }
 }
 'PASS: real Inno completion returned success only for verified deployment; all nine injected failures returned 1001.' | Set-Content (Join-Path $testOutput 'lifecycle-results.txt')
+
+# Compile and run HRESULT/marshalling regression tests against real, unprivileged
+# MSXML COM. Preserve the original 116 installer assertions without edits.
+$diagnosticArgs = @("/DTestOutputRoot=$(Compiler-Path $testOutput)",(Compiler-Path (Join-Path $root 'deployment/tests/ComDiagnosticsTest.iss')))
+$diagnosticExe = Join-Path $testOutput 'ComDiagnosticsTest.exe'
+$diagnosticReport = Join-Path $testOutput 'com-diagnostics-results.txt'
+if ($Wine) {
+    Run-Native $Wine (@((Compiler-Path $Iscc)) + $diagnosticArgs) (Join-Path $work 'logs/com-diagnostics-compile.log')
+    Run-Native $Wine @((Compiler-Path $diagnosticExe),'/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$(Compiler-Path $diagnosticReport)","/LOG=$(Compiler-Path (Join-Path $work 'logs/com-diagnostics-inno.log'))") (Join-Path $work 'logs/com-diagnostics-run.log') 0 $diagnosticReport
+} else {
+    Run-Native $Iscc $diagnosticArgs (Join-Path $work 'logs/com-diagnostics-compile.log')
+    Run-Native $diagnosticExe @('/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$diagnosticReport","/LOG=$(Join-Path $work 'logs/com-diagnostics-inno.log')") (Join-Path $work 'logs/com-diagnostics-run.log') 0 $diagnosticReport
+}
+if (-not (Test-Path $diagnosticReport) -or (Get-Content $diagnosticReport -Raw) -notmatch '^PASS:') { throw 'COM diagnostics tests did not pass.' }
+
+# The disposable task probe compiles the ACTUAL installer COM path, not mocks.
+# Its GUID name is guarded in compiled code; only that task may be modified.
+# Run on an elevated disposable Windows build host. Wine is not Windows coverage.
+$taskProbeArgs = @("/DTestOutputRoot=$(Compiler-Path $testOutput)",(Compiler-Path (Join-Path $root 'deployment/tests/WatchdogTaskProbe.iss')))
+$taskProbeReport = Join-Path $testOutput 'watchdog-task-results.txt'
+if ($Wine) {
+    Run-Native $Wine (@((Compiler-Path $Iscc)) + $taskProbeArgs) (Join-Path $work 'logs/watchdog-task-compile.log')
+    'SKIPPED: actual Windows Task Scheduler integration requires an elevated disposable Windows host; Wine is not Windows validation.' | Set-Content $taskProbeReport
+    Write-Host (Get-Content $taskProbeReport -Raw)
+} else {
+    if (-not $IsWindows) { throw 'Task Scheduler integration requires Windows (or explicit Wine build with coverage marked skipped).' }
+    Run-Native $Iscc $taskProbeArgs (Join-Path $work 'logs/watchdog-task-compile.log')
+    $taskProbeExe = Join-Path $testOutput 'WatchdogTaskProbe.exe'
+    foreach ($injectFailure in 0..1) {
+        $reportPath = if ($injectFailure) { Join-Path $testOutput 'watchdog-cleanup-results.txt' } else { $taskProbeReport }
+        $expected = if ($injectFailure) { 1 } else { 0 }
+        Run-Native $taskProbeExe @('/VERYSILENT','/SUPPRESSMSGBOXES','/SP-',"/REPORT=$reportPath","/FAILAFTERREGISTER=$injectFailure","/LOG=$(Join-Path $work "logs/watchdog-task-inno-$injectFailure.log")") (Join-Path $work "logs/watchdog-task-run-$injectFailure.log") $expected $reportPath
+        if (-not (Test-Path $reportPath)) { throw 'Windows Task Scheduler probe report missing.' }
+        $completed = Get-Content $reportPath -Raw
+        if (-not $injectFailure -and $completed -notmatch '^PASS:') { throw 'Actual Windows Task Scheduler integration failed.' }
+        if ($injectFailure -and ($completed -notmatch 'Injected failure after registration' -or $completed -notmatch 'Cleanup: PASS: disposable task absent')) { throw 'Task Scheduler failure cleanup was not verified.' }
+    }
+}
 
 $isccArguments = @("/DStageRoot=$(Compiler-Path $stage)","/DOutputRoot=$(Compiler-Path $output)","/DPackageVersion=$($version.version)",(Compiler-Path (Join-Path $root 'deployment/installer/AVCPublicAccess.iss')))
 if ($Wine) {

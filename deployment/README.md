@@ -146,3 +146,36 @@ with DTDs/external entities disabled. Task definition is read back after creatio
 Only this installer's own deliberate shutdown phase permits a disabled task;
 a previously disabled or drifted task fails closed and requires administrator
 review before retrying. Ownership/security mismatches are never silently repaired.
+
+### Task Scheduler diagnostics and disposable integration probe
+
+Every Watchdog COM operation logs its phase, member and completion. Failures use
+compiled x64 IDispatch instrumentation to retain the Invoke HRESULT and the
+underlying EXCEPINFO HRESULT, hexadecimal and signed decimal, plus COM source
+and description (including empty fields). The same capture covers deployment
+WMI and local-API COM checks, so an earlier failure is not misattributed to task
+creation. Lifecycle reports that context. No
+credentials or task argument values are logged. The task definition and ownership
+requirements remain unchanged; failures are not silently worked around.
+
+Build-Package retains the 116 compiled checks and lifecycle probes, adds real
+unprivileged MSXML COM marshalling/error tests, and compiles WatchdogTaskProbe.
+On Windows it runs that probe with an explicit process wait and report capture,
+then tests cleanup after an injected post-registration failure. Use an elevated,
+disposable Windows 10/11 x64 build/test host. Do not run the probe on a patron
+workstation. It calls the same RegisterWatchdog/OwnedTask/VerifyWatchdogDefinition
+code without platform mocks. The only substituted identity is a new GUID task
+name prefixed AVC-Installer-Probe-. Its action path is deliberately nonexistent
+under the temporary directory so it cannot launch a production application.
+Existing tasks are enumerated by name only; no other definition is read or
+modified and no Service operation is invoked. The probe confirms its name is
+absent before registration, attempts cleanup even when registration/readback
+fails, verifies absence afterward, and reports cleanup errors as failures.
+Process termination/host failure can interrupt cleanup; the report/log contains
+the exact GUID task name for review on the disposable host.
+
+The executable and reports are build-host test artifacts only, never payloads.
+Reports/logs are under Build/Installer/tests and Build/Installer/logs. A Wine
+build compiles the probe but explicitly records Windows integration as SKIPPED;
+it never claims Windows Task Scheduler compatibility from mocked or Wine tests.
+The installer itself and MH125-01182 are not exercised by these tests.

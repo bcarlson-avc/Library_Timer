@@ -110,6 +110,21 @@ Check (Test-Path $lifecycleReport) 'Missing actual Inno lifecycle/exit-code prob
 Check ((Get-Content $lifecycleReport -Raw) -match '^PASS:') 'Actual Inno lifecycle probes failed'
 Check ($installer -match 'FinishedHeadingLabel.Caption := ''Installation FAILED - NOT VERIFIED''') 'Failure finish-page heading missing'
 Check ($installer -match 'FinishedLabel.Caption := UnverifiedNotice') 'Unverified/THAWED finish-page notice missing'
+$diagnostics = Get-Content (Join-Path $root 'deployment/installer/ComDiagnostics.iss') -Raw
+$taskProbe = Get-Content (Join-Path $root 'deployment/tests/WatchdogTaskProbe.iss') -Raw
+Check (($installer + $native + $lifecycle + $diagnostics) -notmatch '(?i)powershell\.exe|pwsh\.exe|cmd\.exe|Deployment\.ps1|-ExecutionPolicy') 'Diagnostic instrumentation introduced a target shell dependency'
+Check ($lifecycle -match 'DiagnosticFailure\(GetExceptionMessage\)') 'Lifecycle lost operation-specific failure'
+Check ($diagnostics -match 'D\.Invoke' -and $diagnostics -match 'Ex\.Error') 'Raw HRESULT/EXCEPINFO capture missing'
+Check ($diagnostics -match 'IntToStr\(Effective\)' -and $diagnostics -match 'COM source=' -and $diagnostics -match 'COM description=') 'COM diagnostic fields missing'
+Check ($native -match 'ComSet\(Principal, ''Watchdog.Principal.GroupId'', ''S-1-5-32-545''\)' -and $native -match 'ComSet\(Principal, ''Watchdog.Principal.LogonType'', 4\)' -and $native -match 'ComSet\(Principal, ''Watchdog.Principal.RunLevel'', 0\)') 'Production principal definition changed'
+Check ($taskProbe -notmatch '#define DeploymentTest') 'Task Scheduler probe must not mock APIs'
+Check ($taskProbe -match 'RegisterWatchdog;' -and $taskProbe -match 'VerifyWatchdogDefinition\(Task\)') 'Probe bypasses production task path'
+Check ($taskProbe -match 'ProbeCreateGuid' -and $native -match 'production task access forbidden') 'Disposable task isolation missing'
+Check ($taskProbe -match 'CleanupArmed' -and $taskProbe -match 'Probe.Folder.DeleteTask' -and $taskProbe -match 'not DisposableTaskExists') 'Disposable task cleanup missing'
+$diagnosticReport = Join-Path $root 'Build/Installer/tests/com-diagnostics-results.txt'
+Check ((Test-Path $diagnosticReport) -and (Get-Content $diagnosticReport -Raw) -match '^PASS:') 'COM diagnostic regression tests failed or missing'
+$taskReport = Join-Path $root 'Build/Installer/tests/watchdog-task-results.txt'
+Check ((Test-Path $taskReport) -and (Get-Content $taskReport -Raw) -match '^(PASS:|SKIPPED:.*Windows)') 'Task Scheduler coverage result missing'
 Write-Host "$checks legacy/reference and integration checks passed. No Windows deployment actions executed."
 Write-Host (Get-Content $report -Raw)
 Write-Host (Get-Content $lifecycleReport -Raw)
