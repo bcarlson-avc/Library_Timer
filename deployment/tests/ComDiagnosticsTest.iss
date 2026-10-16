@@ -19,6 +19,8 @@ ArchitecturesInstallIn64BitMode=x64os
 #include "../installer/ComDiagnostics.iss"
 procedure ExitProcess(Code: LongWord);
   external 'ExitProcess@kernel32.dll stdcall';
+function TestArrayGet(Handle: NativeUInt; var Index: LongInt; var Value: Variant): HResult;
+  external 'SafeArrayGetElement@oleaut32.dll stdcall';
 var Checks: Integer;
 procedure Check(OK: Boolean; const Name: String);
 begin
@@ -37,7 +39,7 @@ begin
 end;
 
 function InitializeSetup: Boolean;
-var Doc, Root, Node, Nodes, V, Request: Variant; Failed: Boolean; MessageText, Report: String; Ex: TComException; Params: TComParams; Raw: TComStringVariant;
+var Doc, Root, Node, Nodes, V, Request: Variant; Failed: Boolean; MessageText, Report: String; Ex: TComException; Params: TComParams; Raw: TComStringVariant; Arguments: NativeUInt; Index: LongInt; HR: HResult;
 begin
   Result := False; Report := ExpandConstant('{param:REPORT}');
   try
@@ -100,6 +102,26 @@ begin
       Check((Ex.Error = -2147024809) and (ComReadString(Ex.Source) = 'deferred source') and
         (ComReadString(Ex.Description) = 'deferred description'), 'deferred EXCEPINFO HRESULT/source/description ABI');
     finally ComFreeString(Ex.Source); ComFreeString(Ex.Description); ComFreeString(Ex.HelpFile); end;
+    BeginComOperation('Credential VARIANT marshalling regressions');
+    Arguments := ComArrayCreate(12, 0, 2);
+    if Arguments = 0 then RaiseException('Cannot allocate credential VARIANT test array.');
+    try
+      Index := 0; V := Unassigned;
+      HR := ComArrayPut(Arguments, Index, V); CheckComResult(HR, 0, '', '');
+      V := Null;
+      HR := TestArrayGet(Arguments, Index, V); CheckComResult(HR, 0, '', '');
+      Check(VarType(V) = 0, 'absent userId stays VT_EMPTY in native argument array');
+      Index := 1; V := Unassigned;
+      HR := ComArrayPut(Arguments, Index, V); CheckComResult(HR, 0, '', '');
+      V := Null;
+      HR := TestArrayGet(Arguments, Index, V); CheckComResult(HR, 0, '', '');
+      Check(VarType(V) = 0, 'absent password stays VT_EMPTY in native argument array');
+      ComInitString('', V);
+      HR := ComArrayPut(Arguments, Index, V); CheckComResult(HR, 0, '', '');
+      V := Unassigned;
+      HR := TestArrayGet(Arguments, Index, V); CheckComResult(HR, 0, '', '');
+      Check((VarType(V) = 8) and (String(V) = ''), 'empty password string is VT_BSTR, not an absent credential');
+    finally ComArrayDestroy(Arguments); end;
     SaveStringToFile(Report, 'PASS: ' + IntToStr(Checks) + ' COM diagnostic checks (real MSXML/WinHTTP plus error-format fixtures)', False);
     ExitProcess(0);
   except

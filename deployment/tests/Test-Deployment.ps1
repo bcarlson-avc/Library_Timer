@@ -125,6 +125,10 @@ $diagnosticReport = Join-Path $root 'Build/Installer/tests/com-diagnostics-resul
 Check ((Test-Path $diagnosticReport) -and (Get-Content $diagnosticReport -Raw) -match '^PASS:') 'COM diagnostic regression tests failed or missing'
 $taskReport = Join-Path $root 'Build/Installer/tests/watchdog-task-results.txt'
 Check ((Test-Path $taskReport) -and (Get-Content $taskReport -Raw) -match '^(PASS:|SKIPPED:.*Windows)') 'Task Scheduler coverage result missing'
+Check ($native -match '\[WatchdogTaskName, Definition, 6, Unassigned, Unassigned, 4\]') 'Group registration reintroduced credential overrides'
+Check ($native -notmatch 'ComSet\(Principal, ''Watchdog.Principal.UserId''') 'Group definition must not assign a user principal'
+Check ($taskProbe -match 'ProbeRegistrationUserKind = 0' -and $taskProbe -match 'ProbeRegistrationPasswordKind = 0' -and $taskProbe -match 'ProbeRegistrationLogonType = 4') 'Windows probe does not verify actual group registration arguments'
+Check ($diagnostics -match 'ProbeRegistrationUserKind := VarType\(V\)' -and $diagnostics -match 'ProbeRegistrationPasswordKind := VarType\(V\)') 'Integration observation must use actual marshalled VARIANTs'
 Write-Host "$checks legacy/reference and integration checks passed. No Windows deployment actions executed."
 Write-Host (Get-Content $report -Raw)
 Write-Host (Get-Content $lifecycleReport -Raw)

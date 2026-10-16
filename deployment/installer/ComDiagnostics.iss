@@ -30,6 +30,12 @@ type
 var
   DeploymentPhase, DeploymentOperation, LastComFailure: String;
 
+#ifdef WatchdogIntegrationProbe
+var
+  ProbeRegistrationSeen: Boolean;
+  ProbeRegistrationUserKind, ProbeRegistrationPasswordKind, ProbeRegistrationLogonType: Integer;
+#endif
+
 function ComAllocString(Value: String): NativeUInt;
   external 'SysAllocString@oleaut32.dll stdcall';
 function ComAllocSizedString(Value: String; Characters: LongWord): NativeUInt;
@@ -183,6 +189,15 @@ begin
   Dot := 0;
   for J := 1 to Length(Member) do if Member[J] = '.' then Dot := J;
   DispatchMember := Copy(Member, Dot + 1, Length(Member));
+  if DispatchMember = 'RegisterTaskDefinition' then begin
+    Log('Task registration credential override types: userId=' + IntToStr(VarType(Arguments[3])) +
+      '; password=' + IntToStr(VarType(Arguments[4])) + '; logonType=' + IntToStr(Integer(Arguments[5])));
+#ifdef WatchdogIntegrationProbe
+    ProbeRegistrationSeen := False;
+    ProbeRegistrationUserKind := -1; ProbeRegistrationPasswordKind := -1;
+    ProbeRegistrationLogonType := -1;
+#endif
+  end;
   Name := ComAllocString(DispatchMember);
   try
     HR := D.GetIDsOfNames(IID, Name, 1, $800, Id);
@@ -203,6 +218,16 @@ begin
           StringArgument := V; V := Unassigned;
           ComInitString(StringArgument, V);
         end;
+#ifdef WatchdogIntegrationProbe
+        // Observe the actual post-normalization VARIANTs passed to Automation,
+        // not a separate mock of the caller's credential construction.
+        if DispatchMember = 'RegisterTaskDefinition' then begin
+          if Params.Count - 1 - I = 3 then ProbeRegistrationUserKind := VarType(V);
+          if Params.Count - 1 - I = 4 then ProbeRegistrationPasswordKind := VarType(V);
+          if Params.Count - 1 - I = 5 then ProbeRegistrationLogonType := Integer(V);
+          ProbeRegistrationSeen := True;
+        end;
+#endif
         HR := ComArrayPut(ArrayHandle, I, V); CheckComResult(HR, 0, '', '');
       end;
       HR := ComArrayAccess(ArrayHandle, Params.Args); CheckComResult(HR, 0, '', '');

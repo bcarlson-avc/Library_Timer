@@ -179,3 +179,20 @@ Reports/logs are under Build/Installer/tests and Build/Installer/logs. A Wine
 build compiles the probe but explicitly records Windows integration as SKIPPED;
 it never claims Windows Task Scheduler compatibility from mocked or Wine tests.
 The installer itself and MH125-01182 are not exercised by these tests.
+
+### Group-activation registration credentials
+
+Watchdog identity remains Principal.GroupId = S-1-5-32-545 (Builtin Users),
+TASK_LOGON_GROUP (4), least privilege, with the original logon trigger/settings.
+Registration now supplies VT_EMPTY for both userId and password, inheriting the
+explicit group principal without a registration-time credential override. The
+previous SID/empty-string pair supplied an actual VT_BSTR password; an empty
+string is not an absent credential. Principal.UserId is never assigned.
+
+The Windows probe observes the actual post-normalization argument VARIANTs,
+requires both credential overrides to remain VT_EMPTY and logonType to remain 4,
+and retains complete registered-definition ownership checks and failure cleanup.
+Automation regression tests distinguish VT_EMPTY from an empty BSTR using native
+SAFEARRAY round trips. Only argument types and the fixed logon type are logged,
+never credential values. A real Windows probe run is required to establish that
+the observed ERROR_LOGON_FAILURE is resolved; Wine is not that validation.

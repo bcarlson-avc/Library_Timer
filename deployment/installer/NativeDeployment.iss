@@ -628,7 +628,10 @@ begin
   // Preserve the existing unset/empty arguments, without adding a setter.
   WatchdogComparison('construction: default empty arguments', String(ComGet(Action, 'Watchdog.Action.Arguments')) = '');
   BeginDeploymentPhase('Watchdog task registration');
-  Task := ComCall(Folder, 'Watchdog.Folder.RegisterTaskDefinition', [WatchdogTaskName, Definition, 6, 'S-1-5-32-545', '', 4]);
+  // Group activation has no user/password credential pair. VT_EMPTY preserves
+  // the definition's GroupId; an empty BSTR password is still a supplied value.
+  // Do not override the group principal with registration-time credentials.
+  Task := ComCall(Folder, 'Watchdog.Folder.RegisterTaskDefinition', [WatchdogTaskName, Definition, 6, Unassigned, Unassigned, 4]);
   WatchdogDisabledByInstaller := False;
   BeginDeploymentPhase('Watchdog registered-task readback');
   Task := OwnedTask;

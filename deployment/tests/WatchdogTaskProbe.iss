@@ -62,6 +62,10 @@ begin
     CleanupArmed := True;
     try
       RegisterWatchdog;
+      Require(ProbeRegistrationSeen and (ProbeRegistrationUserKind = 0) and
+        (ProbeRegistrationPasswordKind = 0) and (ProbeRegistrationLogonType = 4),
+        'Group registration must send VT_EMPTY credential overrides and TASK_LOGON_GROUP.');
+      Log('PASS: actual registration VARIANTs userId=VT_EMPTY; password=VT_EMPTY; logonType=4.');
       if ExpandConstant('{param:FAILAFTERREGISTER|0}') = '1' then
         RaiseException('Injected failure after registration: verify disposable cleanup.');
       Task := OwnedTask;
@@ -85,7 +89,7 @@ begin
     else CleanupFailure := 'NOT REQUIRED: no registration attempted';
   end;
   if (Failure = '') and (CleanupFailure = 'PASS: disposable task absent') then begin
-    SaveStringToFile(Report, 'PASS: actual Windows Task Scheduler Watchdog creation, complete ownership readback and cleanup; task=' + DisposableWatchdogName, False);
+    SaveStringToFile(Report, 'PASS: actual Windows Task Scheduler Watchdog creation, complete ownership readback, VT_EMPTY credential overrides, group activation and cleanup; task=' + DisposableWatchdogName, False);
     ExitProcess(0);
   end else begin
     SaveStringToFile(Report, 'FAIL: ' + Failure + #13#10 + 'Cleanup: ' + CleanupFailure + #13#10 + 'Task: ' + DisposableWatchdogName, False);
